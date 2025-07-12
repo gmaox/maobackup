@@ -9,13 +9,207 @@ import requests
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 import urllib3
-import opendal
+import xml.etree.ElementTree as ET
+from urllib.parse import urljoin, urlparse
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 #C:\Users\86150\AppData\Local\Programs\Python\Python38\python.exe -m PyInstaller --add-data "icon.ico;." -i icon.ico maobackup.py --noconsole
 # 全局变量
 selected_path = None
 config = {}  # 存储 WebDAV 配置
 path_set = set()
+
+class WebDAVClient:
+    """基于requests的WebDAV客户端，替换opendal功能"""
+    def __init__(self, hostname, username, password):
+        self.hostname = hostname.rstrip("/")
+        self.username = username
+        self.password = password
+        self.session = requests.Session()
+        self.session.auth = (username, password)
+        self.session.verify = False
+        self.session.proxies = {"http": None, "https": None}
+    
+    def list(self, path):
+        """列出目录内容，返回类似opendal的Entry对象列表。自动创建不存在的目录。"""
+        url = urljoin(self.hostname + "/", path)
+        # 构建PROPFIND请求的XML体
+        propfind_xml = '''<?xml version="1.0" encoding="utf-8"?>
+<D:propfind xmlns:D="DAV:">
+    <D:prop>
+        <D:resourcetype/>
+        <D:getlastmodified/>
+        <D:getcontentlength/>
+    </D:prop>
+</D:propfind>'''
+        def try_propfind():
+            response = self.session.request("PROPFIND", url, 
+                headers={
+                    "Depth": "1",
+                    "Content-Type": "application/xml"
+                },
+                data=propfind_xml.encode('utf-8')
+            )
+            response.raise_for_status()
+            return response
+        try:
+            try:
+                response = try_propfind()
+            except requests.exceptions.HTTPError as e:
+                # 409 Conflict: 目录不存在，自动创建
+                if hasattr(e.response, 'status_code') and e.response.status_code == 409:
+                    # 递归创建父目录
+                    parent = os.path.dirname(path.rstrip('/'))
+                    if parent and parent != path:
+                        self._ensure_dir(parent)
+                    # 创建当前目录
+                    mkcol_resp = self.session.request("MKCOL", url)
+                    if mkcol_resp.status_code not in (201, 405):
+                        # 201 Created, 405 Method Not Allowed(已存在)
+                        raise Exception(f"MKCOL失败: {mkcol_resp.status_code}")
+                    # 创建后重试
+                    response = try_propfind()
+                else:
+                    raise
+            # 解析XML响应
+            root = ET.fromstring(response.content)
+            entries = []
+            for response_elem in root.findall(".//{DAV:}response"):
+                href_elem = response_elem.find(".//{DAV:}href")
+                if href_elem is not None:
+                    href = href_elem.text
+                    # 移除URL前缀，只保留相对路径，并进行URL解码
+                    if href.startswith(self.hostname):
+                        href = href[len(self.hostname):]
+                    if href.startswith("/"):
+                        href = href[1:]
+                    from urllib.parse import unquote
+                    href = unquote(href)
+                    # 检查是否为目录
+                    is_dir = False
+                    propstat = response_elem.find(".//{DAV:}propstat")
+                    if propstat is not None:
+                        prop = propstat.find(".//{DAV:}prop")
+                        if prop is not None:
+                            resourcetype = prop.find(".//{DAV:}resourcetype")
+                            if resourcetype is not None:
+                                collection = resourcetype.find(".//{DAV:}collection")
+                                is_dir = collection is not None
+                    entry = type('Entry', (), {
+                        'path': href,
+                        'is_dir': is_dir
+                    })()
+                    entries.append(entry)
+            return entries
+        except Exception as e:
+            print(f"WebDAV list失败: {e}")
+            print(f"请求URL: {url}")
+            print(f"请求头: {response.headers if 'response' in locals() else 'N/A'}")
+            print(f"响应状态码: {response.status_code if 'response' in locals() else 'N/A'}")
+            if 'response' in locals() and response.content:
+                print(f"响应内容: {response.content[:500]}...")
+            return []
+
+    def _ensure_dir(self, path):
+        """递归创建目录（仅用于list自动修复）"""
+        url = urljoin(self.hostname + "/", path)
+        parent = os.path.dirname(path.rstrip('/'))
+        if parent and parent != path:
+            self._ensure_dir(parent)
+        mkcol_resp = self.session.request("MKCOL", url)
+        # 201 Created, 405 Method Not Allowed(已存在)
+        if mkcol_resp.status_code not in (201, 405):
+            raise Exception(f"MKCOL失败: {mkcol_resp.status_code}")
+    
+    def stat(self, path):
+        """获取文件信息，返回类似opendal的Stat对象"""
+        url = urljoin(self.hostname + "/", path)
+        
+        # 构建PROPFIND请求的XML体
+        propfind_xml = '''<?xml version="1.0" encoding="utf-8"?>
+<D:propfind xmlns:D="DAV:">
+    <D:prop>
+        <D:resourcetype/>
+        <D:getlastmodified/>
+        <D:getcontentlength/>
+    </D:prop>
+</D:propfind>'''
+        
+        try:
+            response = self.session.request("PROPFIND", url, 
+                headers={
+                    "Depth": "0",
+                    "Content-Type": "application/xml"
+                },
+                data=propfind_xml.encode('utf-8')
+            )
+            response.raise_for_status()
+            
+            # 解析XML响应
+            root = ET.fromstring(response.content)
+            
+            # 查找lastmodified
+            last_modified = None
+            for response_elem in root.findall(".//{DAV:}response"):
+                propstat = response_elem.find(".//{DAV:}propstat")
+                if propstat is not None:
+                    prop = propstat.find(".//{DAV:}prop")
+                    if prop is not None:
+                        lastmodified_elem = prop.find(".//{DAV:}getlastmodified")
+                        if lastmodified_elem is not None:
+                            last_modified_str = lastmodified_elem.text
+                            # 解析时间格式 "Wed, 09 Jun 2021 10:18:14 GMT"
+                            try:
+                                from email.utils import parsedate_to_datetime
+                                last_modified = parsedate_to_datetime(last_modified_str)
+                            except:
+                                pass
+            
+            # 创建类似opendal.Stat的对象
+            stat_obj = type('Stat', (), {
+                'last_modified': last_modified
+            })()
+            return stat_obj
+        except Exception as e:
+            print(f"WebDAV stat失败: {e}")
+            print(f"请求URL: {url}")
+            print(f"请求头: {response.headers if 'response' in locals() else 'N/A'}")
+            print(f"响应状态码: {response.status_code if 'response' in locals() else 'N/A'}")
+            if 'response' in locals() and response.content:
+                print(f"响应内容: {response.content[:500]}...")
+            return None
+    
+    def write(self, path, data):
+        """上传文件"""
+        url = urljoin(self.hostname + "/", path)
+        try:
+            response = self.session.put(url, data=data)
+            response.raise_for_status()
+            return True
+        except Exception as e:
+            print(f"WebDAV write失败: {e}")
+            print(f"请求URL: {url}")
+            print(f"请求头: {response.headers if 'response' in locals() else 'N/A'}")
+            print(f"响应状态码: {response.status_code if 'response' in locals() else 'N/A'}")
+            if 'response' in locals() and response.content:
+                print(f"响应内容: {response.content[:500]}...")
+            return False
+    
+    def read(self, path):
+        """下载文件"""
+        url = urljoin(self.hostname + "/", path)
+        try:
+            response = self.session.get(url)
+            response.raise_for_status()
+            return response.content
+        except Exception as e:
+            print(f"WebDAV read失败: {e}")
+            print(f"请求URL: {url}")
+            print(f"请求头: {response.headers if 'response' in locals() else 'N/A'}")
+            print(f"响应状态码: {response.status_code if 'response' in locals() else 'N/A'}")
+            if 'response' in locals() and response.content:
+                print(f"响应内容: {response.content[:500]}...")
+            return None
+
 if datetime.now() > datetime(2025, 12, 3):
     messagebox.showerror("测试结束", "为保证安全性，该版本已停止使用，请联系作者获取最新版本。")
     sys.exit(0)
@@ -162,7 +356,7 @@ def backup():
     threading.Thread(target=perform_backup, args=(selected_path, game_name, remark, backup_path)).start()
 
 def ensure_parent_dir_opendal(operator, remote_path):
-    """确保远程父目录存在：通过上传一个空文件到父目录下的1.txt实现"""
+    """确保远程父目录存在：通过上传一个空文件到父目录下的welcome文件实现"""
     parent = os.path.dirname(os.path.dirname(remote_path))
     if parent and parent != ".":
         # 用 / 替换所有 \\，确保路径格式正确
@@ -174,11 +368,11 @@ def ensure_parent_dir_opendal(operator, remote_path):
             operator.write(test_file, b"")
 
 def perform_backup(path, game_name, remark, backup_path):
-    """执行备份：保留父目录，记录完整路径，打包并上传到 WebDAV (opendal)"""
+    """执行备份：保留父目录，记录完整路径，打包并上传到 WebDAV"""
     try:
         operator = get_opendal_operator()
         if operator is None:
-            print("opendal Operator 初始化失败")
+            print("WebDAV 客户端初始化失败")
             return
         timestamp = datetime.now().strftime("%Y %m%d %H%M%S")
         system = platform.node() # 获取本机电脑名
@@ -237,9 +431,12 @@ def perform_backup(path, game_name, remark, backup_path):
         ensure_parent_dir_opendal(operator, remote_path)
         with open(local_zip, "rb") as f:
             data = f.read()
-        operator.write(remote_path, data)
-        print("备份完成")
-        messagebox.showinfo("备份完成", f"备份已上传到远程: {remote_path}")
+        if operator.write(remote_path, data):
+            print("备份完成")
+            messagebox.showinfo("备份完成", f"备份已上传到远程: {remote_path}")
+        else:
+            print("备份失败：上传失败")
+            messagebox.showerror("错误", "备份失败：上传失败")
         os.remove(local_zip)
     except Exception as e:
         print(f"备份失败：{e}")
@@ -251,14 +448,17 @@ def dir_exists(client, path):
     try:
         parent = os.path.dirname(path) or '/'
         items = client.list(parent)
-        folder_name = os.path.basename(path.rstrip('/')) + '/'
-        return folder_name in items
+        folder_name = os.path.basename(path.rstrip('/'))
+        for item in items:
+            if item.path == folder_name and item.is_dir:
+                return True
+        return False
     except Exception as e:
         print(f"检查目录 {path} 是否存在时出错: {e}")
         return False
 
 def get_opendal_operator():
-    """根据配置创建 opendal Operator"""
+    """根据配置创建 WebDAV 客户端"""
     global config
     if not config:
         try:
@@ -270,15 +470,14 @@ def get_opendal_operator():
         except Exception:
             return None
     try:
-        operator = opendal.Operator(
-            "webdav",
-            endpoint=config["hostname"].rstrip("/"),
+        operator = WebDAVClient(
+            hostname=config["hostname"],
             username=config["username"],
             password=config["password"]
         )
         return operator
     except Exception as e:
-        print(f"opendal Operator 初始化失败: {e}")
+        print(f"WebDAV 客户端初始化失败: {e}")
         return None
 
 def configure_webdav():
@@ -340,12 +539,22 @@ def list_backups():
         messagebox.showerror("错误", "WebDAV 未配置")
         return
     def walk_dir(path, files):
+        # 确保 path 以 / 结尾
+        if not path.endswith('/'):
+            path = path + '/'
         for entry in client.list(path):
-            p = entry.path
-            if p.endswith('/'):
-                walk_dir(p, files)
-            elif p.endswith('.zip'):
-                rel_path = p[len("python-upload/"):]
+            # 跳过自身目录（有些 WebDAV 返回 "" 或 "." 作为当前目录）
+            if not entry.path or entry.path in ('.', './'):
+                continue
+            # 只取 entry.path 的最后一级，避免路径重复
+            entry_name = entry.path.rstrip('/').split('/')[-1]
+            if not entry_name:
+                continue
+            next_path = path + entry_name
+            if entry.is_dir:
+                walk_dir(next_path, files)
+            elif next_path.endswith('.zip'):
+                rel_path = next_path[len('python-upload/'):]
                 files.append(rel_path)
     try:
         files = []
@@ -376,22 +585,23 @@ def show_all_remote_backups():
     list_backups()
 
 def download_webdav_file(remote_path, local_path):
-    import os
-    os.environ["HTTP_PROXY"] = ""
-    os.environ["HTTPS_PROXY"] = ""
-    # 读取配置
-    with open("webdav_config.json", "r", encoding="utf-8") as f:
-        cfg = json.load(f)
-    url = cfg["hostname"].rstrip("/") + "/" + remote_path
-    user = base64.b64decode(cfg["username"]).decode()
-    pwd = base64.b64decode(cfg["password"]).decode()
-    r = requests.get(url, auth=(user, pwd), verify=False, proxies={"http": None, "https": None})
-    if r.status_code == 200:
-        with open(local_path, "wb") as f:
-            f.write(r.content)
-        return True
-    else:
-        print("下载失败，状态码：", r.status_code)
+    """使用WebDAV客户端下载文件"""
+    client = get_opendal_operator()
+    if not client:
+        print("WebDAV 未配置")
+        return False
+    
+    try:
+        data = client.read(remote_path)
+        if data is not None:
+            with open(local_path, "wb") as f:
+                f.write(data)
+            return True
+        else:
+            print("下载失败：无法读取文件")
+            return False
+    except Exception as e:
+        print(f"下载失败：{e}")
         return False
 def restore_selected(entry=None):
     """下载选中的备份 ZIP，读取 backup_path.txt 并恢复文件，自动保存新游戏名和路径到本地配置
@@ -704,7 +914,7 @@ def quick_action(game_name):
     def walk_dir(path, files):
         for entry in client.list(path):
             p = entry.path
-            if p.endswith('/'):
+            if entry.is_dir:
                 walk_dir(p, files)
             elif p.endswith('.zip'):
                 files.append(p)
@@ -730,7 +940,9 @@ def quick_action(game_name):
     # 如果无法解析时间，尝试用stat
     if remote_time == 0:
         try:
-            remote_time = client.stat(latest_zip).last_modified.timestamp()
+            stat_obj = client.stat(latest_zip)
+            if stat_obj and stat_obj.last_modified:
+                remote_time = stat_obj.last_modified.timestamp()
         except Exception:
             remote_time = 0
     print(f"本地最新修改时间: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(local_latest_mtime)) if local_latest_mtime else '无'}")
