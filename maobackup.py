@@ -1,6 +1,7 @@
 import base64
 import sys
 import time
+import webbrowser
 import os, threading, zipfile, json, platform
 from datetime import datetime
 import tkinter as tk
@@ -11,6 +12,8 @@ from watchdog.events import FileSystemEventHandler
 import urllib3
 import xml.etree.ElementTree as ET
 from urllib.parse import urljoin, urlparse
+from win10toast import ToastNotifier
+toaster = ToastNotifier()
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 #C:\Users\86150\AppData\Local\Programs\Python\Python38\python.exe -m PyInstaller --add-data "icon.ico;." -i icon.ico maobackup.py --noconsole
 # 全局变量
@@ -223,6 +226,7 @@ class MyHandler(FileSystemEventHandler):
         if directory not in self.directories:
             self.directories.add(directory)
             self.listbox.insert(tk.END, directory)
+            self.listbox.see(tk.END)
 
     def on_created(self, event):
         directory = os.path.dirname(event.src_path)
@@ -261,9 +265,19 @@ class StatusWindow:
         self.text = tk.Text(self.root, width=80, height=30, wrap="word")
         self.text.pack(fill="both", expand=True)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        # 保存原始stdout和stderr
+        self._orig_stdout = sys.__stdout__
+        self._orig_stderr = sys.__stderr__
         # 重定向stdout和stderr
-        sys.stdout = TextRedirector(self.text)
-        sys.stderr = TextRedirector(self.text)
+        self._redirector = TextRedirector(self.text)
+        sys.stdout = self._redirector
+        sys.stderr = self._redirector
+    def restore_redirect(self):
+        sys.stdout = self._redirector
+        sys.stderr = self._redirector
+    def restore_orig(self):
+        sys.stdout = self._orig_stdout
+        sys.stderr = self._orig_stderr
     def mainloop(self):
         self.root.mainloop()
     def on_close(self):
@@ -347,7 +361,7 @@ def backup():
     """点击备份按钮后，自动填充游戏名和路径，未选择时提示"""
     global selected_path, game_name
     if not selected_path or not game_name:
-        messagebox.showerror("错误", "请先选择一个游戏或路径！")
+        show_message("error", "错误", "请先选择一个游戏或路径！")
         return
     print(f"开始备份路径: {selected_path}, 游戏名: {game_name}")
     #remark = simpledialog.askstring("备注", "请输入备注（可选）：", parent=root)
@@ -433,14 +447,18 @@ def perform_backup(path, game_name, remark, backup_path):
             data = f.read()
         if operator.write(remote_path, data):
             print("备份完成")
-            messagebox.showinfo("备份完成", f"备份已上传到远程: {remote_path}")
+            # 若工作目录中存在 DeskGamix.exe，且为快速操作，则弹出托盘通知，否则弹窗
+            if '--quick-dgaction' in sys.argv:
+                toaster.show_toast("备份完成", f"备份已上传到远程: {remote_path}", icon_path='', duration=1)
+            else:
+                show_message("info", "备份完成", f"备份已上传到远程: {remote_path}")
         else:
             print("备份失败：上传失败")
-            messagebox.showerror("错误", "备份失败：上传失败")
+            show_message("error", "错误", "备份失败：上传失败")
         os.remove(local_zip)
     except Exception as e:
         print(f"备份失败：{e}")
-        messagebox.showerror("错误", f"备份失败: {e}")
+        show_message("error", "错误", f"备份失败: {e}")
         return
 
 def dir_exists(client, path):
@@ -512,7 +530,7 @@ def configure_webdav():
         user = entry_user.get().strip()
         pwd = entry_pass.get().strip()
         if not host or not user:
-            messagebox.showerror("错误", "WebDAV 主机和用户名不能为空！")
+            show_message("error", "错误", "WebDAV 主机和用户名不能为空！")
             return
         # 简单加密
         cfg = {
@@ -526,19 +544,27 @@ def configure_webdav():
         config["hostname"] = host
         config["username"] = user
         config["password"] = pwd
-        messagebox.showinfo("配置", "WebDAV 配置已保存。")
+        show_message("info", "配置", "WebDAV 配置已保存。")
         dialog.destroy()
-
-    tk.Button(dialog, text="保存WebDAV 配置", command=save).grid(row=4, column=0, columnspan=2, pady=10)
+    # 添加坚果云和GitHub按钮
+    def open_jianguoyun():
+        webbrowser.open("https://www.jianguoyun.com/")
+    def open_github():
+        webbrowser.open("https://github.com/gmaox/maobackup")
+    btn_frame = tk.Frame(dialog)
+    btn_frame.grid(row=5, column=0, columnspan=2, pady=2)
+    tk.Button(btn_frame, text="坚果云网盘", command=open_jianguoyun).pack(side="left", padx=5)
+    tk.Button(btn_frame, text="GitHub地址", command=open_github).pack(side="left", padx=5)
+    tk.Button(btn_frame, text="保存WebDAV 配置", command=save).pack(side="left", padx=5)
 
 def list_backups():
     """递归获取 python-upload/ 下所有 ZIP 文件，并显示在远程列表框，暂停本地监听。若已选择游戏，只显示该游戏存档。"""
     stop_monitor()
     client = get_opendal_operator()
     if not client:
-        messagebox.showerror("错误", "WebDAV 未配置")
+        show_message("error", "错误", "WebDAV 未配置")
         return
-    def walk_dir(path, files):
+    def walk_dir(path, files, dirs):
         # 确保 path 以 / 结尾
         if not path.endswith('/'):
             path = path + '/'
@@ -546,32 +572,111 @@ def list_backups():
             # 跳过自身目录（有些 WebDAV 返回 "" 或 "." 作为当前目录）
             if not entry.path or entry.path in ('.', './'):
                 continue
-            # 只取 entry.path 的最后一级，避免路径重复
             entry_name = entry.path.rstrip('/').split('/')[-1]
             if not entry_name:
                 continue
             next_path = path + entry_name
             if entry.is_dir:
-                walk_dir(next_path, files)
+                # 只收集一级目录名（即游戏名）
+                if path == "python-upload/":
+                    dirs.append(entry_name)
+                else:
+                    walk_dir(next_path, files, dirs)
             elif next_path.endswith('.zip'):
                 rel_path = next_path[len('python-upload/'):]
                 files.append(rel_path)
     try:
         files = []
+        dirs = []
         # 若已选择游戏，只拉取该游戏的存档
         if game_name_var.get():
             game = game_name_var.get()
-            walk_dir(f"python-upload/{game}/", files)
+            walk_dir(f"python-upload/{game}/", files, dirs)
             show_all_btn.pack(side="left", padx=5)
+            listbox_remote.delete(0, tk.END)
+            for f in reversed(files):
+                listbox_remote.insert(tk.END, f)
+            listbox_remote.pack()  # 确保显示
         else:
-            walk_dir("python-upload/", files)
+            walk_dir("python-upload/", files, dirs)
             show_all_btn.pack_forget()
-        listbox_remote.delete(0, tk.END)
-        for f in files:
-            listbox_remote.insert(tk.END, f)
-        listbox_remote.pack()  # 确保显示
+            # 只显示游戏列表
+            listbox_remote.delete(0, tk.END)
+            for d in dirs:
+                listbox_remote.insert(tk.END, d)
+            listbox_remote.pack()
+            # 绑定点击事件：点击后自动选择该游戏并拉取存档
+            def on_game_select(event=None):
+                sel = listbox_remote.curselection()
+                if not sel:
+                    return
+                game = listbox_remote.get(sel[0])
+                # 优先查找本地webdav_config.json是否有该游戏路径
+                restored_path = None
+                try:
+                    with open("webdav_config.json", "r", encoding="utf-8") as f:
+                        cfg = json.load(f)
+                    games = cfg.get("games", [])
+                    for g in games:
+                        if g.get("name") == game and g.get("path"):
+                            restored_path = g["path"]
+                            break
+                except Exception:
+                    pass
+                # 如果本地没有路径，则下载zip获取路径
+                if not restored_path:
+                    temp_files = []
+                    walk_dir(f"python-upload/{game}/", temp_files, [])
+                    if temp_files:
+                        remote_path = f"python-upload/{temp_files[0]}"
+                        local_zip = os.path.join(os.getcwd(), os.path.basename(temp_files[0]))
+                        if download_webdav_file(remote_path, local_zip):
+                            try:
+                                with zipfile.ZipFile(local_zip, 'r') as z:
+                                    path_txt = z.read("backup_path.txt").decode("utf-8").strip()
+                                    restored_path = os.path.expandvars(path_txt)
+                            except Exception:
+                                pass
+                            finally:
+                                try:
+                                    os.remove(local_zip)
+                                except Exception:
+                                    pass
+                # 设置全局变量并刷新
+                global selected_path, game_name
+                selected_path = restored_path if restored_path else ""
+                game_name = game
+                selected_path_var.set(selected_path)
+                game_name_var.set(game_name)
+                update_selected_info()
+                # 保存到 webdav_config.json（如果本地没有则补充）
+                if restored_path:
+                    try:
+                        with open("webdav_config.json", "r", encoding="utf-8") as f:
+                            cfg = json.load(f)
+                    except Exception:
+                        cfg = {}
+                    games = cfg.get("games", [])
+                    found = False
+                    for g in games:
+                        if g.get("name") == game:
+                            if not g.get("path"):
+                                g["path"] = restored_path
+                            found = True
+                            break
+                    if not found:
+                        games.append({"name": game, "path": restored_path})
+                    cfg["games"] = games
+                    cfg["last_selected"] = {"name": game, "path": restored_path}
+                    with open("webdav_config.json", "w", encoding="utf-8") as f:
+                        json.dump(cfg, f, ensure_ascii=False, indent=2)
+                # 重新拉取该游戏的存档
+                list_backups()
+            # 只绑定一次
+            listbox_remote.unbind("<Double-Button-1>")
+            listbox_remote.bind("<Double-Button-1>", on_game_select)
     except Exception as e:
-        messagebox.showerror("错误", e)
+        show_message("error", "错误", e)
         print(f"获取备份列表失败: {e}")
 
 def show_all_remote_backups():
@@ -611,21 +716,23 @@ def restore_selected(entry=None):
         if not sel:
             return
         entry = listbox_remote.get(sel[0])
-    if '/' in entry:
-        game, zipname = entry.split('/', 1)
-    else:
-        messagebox.showerror("错误", "无效的备份文件路径")
+    # 支持多级目录，entry 形如 test1/xxx.zip 或 test1/子目录/xxx.zip
+    parts = entry.split('/')
+    if len(parts) < 2:
+        show_message("error", "错误", "无效的备份文件路径")
         return
+    game = parts[0]
+    zipname = '/'.join(parts[1:])
     remote_path = f"python-upload/{entry}" if not entry.startswith("python-upload/") else entry
     client = get_opendal_operator()
     if not client:
-        messagebox.showerror("错误", "WebDAV 未配置")
+        show_message("error", "错误", "WebDAV 未配置")
         return
     # 修复：本地 zip 路径只用文件名，避免多级目录不存在
     local_zip = os.path.join(os.getcwd(), os.path.basename(zipname))
     success = download_webdav_file(remote_path, local_zip)
     if not success:
-        messagebox.showerror("错误", f"下载失败: {remote_path}")
+        show_message("error", "错误", f"下载失败: {remote_path}")
         return
     try:
         with zipfile.ZipFile(local_zip, 'r') as z:
@@ -636,7 +743,7 @@ def restore_selected(entry=None):
             all_names = z.namelist()
             dir_names = [n.split('/')[0] for n in all_names if '/' in n and not n.startswith('__MACOSX')]
             if not dir_names:
-                messagebox.showerror("错误", "备份包中未找到存档目录")
+                show_message("error", "错误", "备份包中未找到存档目录")
                 return
             archive_dir = os.path.basename(restored_path)
             # 统计存档目录下文件总大小
@@ -647,8 +754,13 @@ def restore_selected(entry=None):
                     info = z.getinfo(member)
                     total_size += info.file_size
                     file_count += 1
-            # 获取zip文件修改时间
-            zip_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(os.path.getmtime(local_zip)))
+            # 获取zip内backup_path.txt的修改时间作为备份时间
+            try:
+                info = z.getinfo("backup_path.txt")
+                # info.date_time: (year, month, day, hour, minute, second)
+                zip_time = time.strftime('%Y-%m-%d %H:%M:%S', time.struct_time((info.date_time[0], info.date_time[1], info.date_time[2], info.date_time[3], info.date_time[4], info.date_time[5], 0, 0, -1)))
+            except Exception:
+                zip_time = "N/A"
             # 自动保存到webdav_config.json
             saved_to_local = False
             try:
@@ -680,7 +792,7 @@ def restore_selected(entry=None):
             if saved_to_local:
                 msg += "游戏路径信息已保存本地供下次备份使用。\n"
             msg += "\n是否确认还原？"
-            if not messagebox.askokcancel("还原确认", msg):
+            if not show_message("confirm", "还原确认", msg):
                 return
             save_dir = os.path.join(os.path.dirname(restored_path), archive_dir)
             # ----------- 新增：先备份当前存档目录到/extra_backup -------------
@@ -692,16 +804,28 @@ def restore_selected(entry=None):
             backup_time = time.strftime('%Y%m%d_%H%M%S')
             backup_zip_path = os.path.join(backup_dir, f"{archive_dir}_{backup_time}.zip")
             if os.path.exists(restored_path) and os.path.isdir(restored_path):
+                # 先写入backup_path.txt到临时文件
+                backup_path_txt = os.path.join(os.path.dirname(restored_path), "backup_path.txt")
                 try:
+                    with open(backup_path_txt, "w", encoding="utf-8") as f:
+                        f.write(restored_path)
                     with zipfile.ZipFile(backup_zip_path, 'w', zipfile.ZIP_DEFLATED) as backup_zip:
+                        # 打包存档目录
                         for root_, dirs_, files_ in os.walk(restored_path):
                             for file_ in files_:
                                 file_path_ = os.path.join(root_, file_)
                                 arcname_ = os.path.relpath(file_path_, os.path.dirname(restored_path))
                                 backup_zip.write(file_path_, arcname_)
+                        # 打包backup_path.txt到zip根目录
+                        backup_zip.write(backup_path_txt, "backup_path.txt")
                 except Exception as e:
-                    messagebox.showwarning("备份警告", f"备份原存档目录失败: {e}")
+                    show_message("warning", "备份警告", f"备份原存档目录失败: {e}")
                     return
+                finally:
+                    try:
+                        os.remove(backup_path_txt)
+                    except Exception:
+                        pass
             # ----------- 新增：清空目标目录 -------------
             if os.path.exists(restored_path) and os.path.isdir(restored_path):
                 try:
@@ -722,7 +846,7 @@ def restore_selected(entry=None):
             for member in all_names:
                 if member.startswith(archive_dir + "/"):
                     z.extract(member, os.path.dirname(restored_path))
-        messagebox.showinfo("还原完成", f"存档已还原到: {restored_path}")
+        show_message("info", "还原完成", f"存档已还原到: {restored_path}")
     finally:
         try:
             os.remove(local_zip)
@@ -732,7 +856,7 @@ def restore_selected(entry=None):
 def delete_selected_game():
     sel = saved_listbox.curselection()
     if not sel:
-        messagebox.showinfo("提示", "请先选择要删除的游戏。")
+        show_message("info", "提示", "请先选择要删除的游戏。")
         return
     idx = sel[0]
     try:
@@ -744,7 +868,7 @@ def delete_selected_game():
     if idx >= len(games):
         return
     g = games[idx]
-    if not messagebox.askyesno("确认", f"确定要删除游戏：{g['name']} ?"):
+    if not show_message("confirm", "确认", f"确定要删除游戏：{g['name']} ?"):
         return
     del games[idx]
     cfg["games"] = games
@@ -776,7 +900,7 @@ def add_desktop_shortcut():
     import os
     sel = saved_listbox.curselection()
     if not sel:
-        messagebox.showinfo("提示", "请先选择要添加快捷方式的游戏。")
+        show_message("info", "提示", "请先选择要添加快捷方式的游戏。")
         return
     idx = sel[0]
     try:
@@ -807,7 +931,7 @@ def add_desktop_shortcut():
         except Exception:
             pass
     if not os.path.exists(desktop):
-        messagebox.showerror("桌面路径错误", f"无法定位桌面路径，请手动创建快捷方式。\n尝试的路径: {desktop}")
+        show_message("error", "桌面路径错误", f"无法定位桌面路径，请手动创建快捷方式。\n尝试的路径: {desktop}")
         return
     exe_path = os.path.abspath(sys.argv[0])
     shortcut_path = os.path.join(desktop, shortcut_name)
@@ -821,12 +945,13 @@ exit
     try:
         with open(shortcut_path, "w", encoding="utf-8") as f:
             f.write(bat_content)
-        messagebox.showinfo(
+        show_message(
+            "info",
             "快捷方式",
             f"桌面批处理文件已创建：{shortcut_name}，双击可一键备份/还原该游戏。\n同步逻辑如下：\n双击后，程序会自动检测本地游戏存档时间和远程对比\n若本地存档较旧，会将远程较新的存档覆盖本地存档。\n（覆盖前会将存档zip备份到程序运行目录下的/extra_backup中）\n若本地存档较新，则会将本地存档打包上传到远程。"
         )
     except Exception as e:
-        messagebox.showerror("快捷方式创建失败", f"创建批处理文件时发生错误：{e}\n请检查桌面路径和写入权限。\n目标: {shortcut_path}")
+        show_message("error", "快捷方式创建失败", f"创建批处理文件时发生错误：{e}\n请检查桌面路径和写入权限。\n目标: {shortcut_path}")
 
 import tkinter.filedialog
 
@@ -882,7 +1007,7 @@ def manual_select_path():
     with open("webdav_config.json", "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
 def quick_action(game_name):
-    # 读取本地配置，找到游戏路径
+    # 读取本地配置，找到游戏路径（如果本地没有，后面会用zip内路径）
     try:
         with open("webdav_config.json", "r", encoding="utf-8") as f:
             cfg = json.load(f)
@@ -890,69 +1015,108 @@ def quick_action(game_name):
     except Exception:
         games = []
     game = next((g for g in games if g["name"] == game_name), None)
-    if not game:
-        print(f"未找到游戏：{game_name}")
-        return
-    path = game["path"]
-    # 获取本地存档目录下所有文件的最新修改时间
-    local_latest_mtime = 0
-    if os.path.exists(path):
-        for root_, dirs_, files_ in os.walk(path):
-            for file_ in files_:
-                try:
-                    mtime = os.path.getmtime(os.path.join(root_, file_))
-                    if mtime > local_latest_mtime:
-                        local_latest_mtime = mtime
-                except Exception:
-                    pass
-    # 获取远程最新备份zip及其时间
+    local_path = game["path"] if game else None
+
     client = get_opendal_operator()
     if not client:
-        print("WebDAV 未配置")
+        show_message("error","错误","WebDAV 未配置")
         return
+    # 1. 列出所有远程zip
     files = []
     def walk_dir(path, files):
+        # path: 远程当前目录
         for entry in client.list(path):
-            p = entry.path
+            # 跳过自身目录（有些 WebDAV 返回 "" 或 "." 作为当前目录）
+            if not entry.path or entry.path in ('.', './'):
+                continue
+            entry_name = entry.path.rstrip('/').split('/')[-1]
+            if not entry_name:
+                continue
+            next_path = path.rstrip('/') + '/' + entry_name
             if entry.is_dir:
-                walk_dir(p, files)
-            elif p.endswith('.zip'):
-                files.append(p)
+                walk_dir(next_path, files)
+            elif next_path.endswith('.zip'):
+                rel_path = next_path[len('python-upload/'):]
+                files.append(rel_path)
     walk_dir(f"python-upload/{game_name}/", files)
     if not files:
-        print("无远程备份，自动执行备份...")
-        do_backup(game_name, path)
+        # 没有远程备份，直接用本地路径备份
+        if local_path:
+            print("无远程备份，自动执行备份...")
+            do_backup(game_name, local_path)
+        else:
+            print("无远程备份，且本地未找到路径，无法备份。")
         return
-    # 找到最新的zip和时间
-    def parse_zip_time(zipname):
-        # 例：游戏名-YYYY MMDD HHMMSS-电脑名.zip
-        import re
-        m = re.search(r"-(\d{4} \d{4} \d{6})-", zipname)
-        if m:
-            try:
-                return time.mktime(time.strptime(m.group(1), "%Y %m%d %H%M%S"))
-            except Exception:
-                return 0
-        return 0
+    # 2. 找到最新zip
     files.sort(reverse=True)
     latest_zip = files[0]
-    remote_time = parse_zip_time(os.path.basename(latest_zip))
-    # 如果无法解析时间，尝试用stat
-    if remote_time == 0:
+    # latest_zip 已经是相对 python-upload/ 的路径
+    remote_path = f"python-upload/{latest_zip}"
+    # 3. 下载zip到本地临时文件
+    import tempfile
+    tmp_zip = tempfile.mktemp(suffix=".zip")
+    success = download_webdav_file(remote_path, tmp_zip)
+    if not success:
+        print(f"下载远程备份失败: {remote_path}")
+        return
+    try:
+        with zipfile.ZipFile(tmp_zip, 'r') as z:
+            # 4. 读取 backup_path.txt 得到原始路径
+            try:
+                path_txt = z.read("backup_path.txt").decode("utf-8").strip()
+                restored_path = os.path.expandvars(path_txt)
+            except Exception:
+                print("zip包中未找到 backup_path.txt，无法自动还原")
+                restored_path = None
+            # 5. 统计本地该路径下所有文件的最新修改时间
+            local_latest_mtime = 0
+            if restored_path and os.path.exists(restored_path):
+                for root_, dirs_, files_ in os.walk(restored_path):
+                    for file_ in files_:
+                        try:
+                            mtime = os.path.getmtime(os.path.join(root_, file_))
+                            if mtime > local_latest_mtime:
+                                local_latest_mtime = mtime
+                        except Exception:
+                            pass
+            elif local_path and os.path.exists(local_path):
+                for root_, dirs_, files_ in os.walk(local_path):
+                    for file_ in files_:
+                        try:
+                            mtime = os.path.getmtime(os.path.join(root_, file_))
+                            if mtime > local_latest_mtime:
+                                local_latest_mtime = mtime
+                        except Exception:
+                            pass
+            # 6. 直接用zip内backup_path.txt的修改时间作为远程备份时间
+            try:
+                info = z.getinfo("backup_path.txt")
+                remote_time = time.mktime((info.date_time[0], info.date_time[1], info.date_time[2], info.date_time[3], info.date_time[4], info.date_time[5], 0, 0, -1))
+                zip_time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.struct_time((info.date_time[0], info.date_time[1], info.date_time[2], info.date_time[3], info.date_time[4], info.date_time[5], 0, 0, -1)))
+            except Exception:
+                remote_time = 0
+                zip_time_str = "N/A"
+            print(f"本地最新修改时间: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(local_latest_mtime)) if local_latest_mtime else '无'}")
+            print(f"远程备份时间: {zip_time_str}")
+            # 7. 比较时间，决定备份还是还原
+            if local_latest_mtime > remote_time:
+                # 优先用 zip 里的路径
+                if restored_path:
+                    print("本地较新，执行备份...")
+                    do_backup(game_name, restored_path)
+                elif local_path:
+                    print("本地较新，执行备份...")
+                    do_backup(game_name, local_path)
+                else:
+                    print("未找到本地路径，无法备份")
+            else:
+                print("远程较新，执行还原...")
+                restore_selected(latest_zip)
+    finally:
         try:
-            stat_obj = client.stat(latest_zip)
-            if stat_obj and stat_obj.last_modified:
-                remote_time = stat_obj.last_modified.timestamp()
+            os.remove(tmp_zip)
         except Exception:
-            remote_time = 0
-    print(f"本地最新修改时间: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(local_latest_mtime)) if local_latest_mtime else '无'}")
-    print(f"远程备份时间: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(remote_time)) if remote_time else '无'}")
-    if local_latest_mtime > remote_time:
-        print("本地较新，执行备份...")
-        do_backup(game_name, path)
-    else:
-        print("远程较新，执行还原...")
-        restore_selected(latest_zip)
+            pass
 
 def do_backup(game_name, path):
     print(f"自动备份: {game_name} {path}")
@@ -974,11 +1138,44 @@ def do_backup(game_name, path):
 
 # ----------- Tkinter 界面布局 -----------
 root = tk.Tk()
-root.title("游戏存档备份工具")
+root.title("游戏存档备份工具 v0.12")
 try:
-    root.iconbitmap("icon.ico")
+    icon_path = "./_internal/icon.ico"
+    root.iconbitmap(icon_path)
 except Exception:
     pass
+
+def show_message(type_, title, message):
+    if '--quick-dgaction' in sys.argv or '--quick-dgrestore' in sys.argv:
+        # 临时恢复原stdout/stderr（如果有StatusWindow实例）
+        status_win = None
+        for v in globals().values():
+            if isinstance(v, StatusWindow):
+                status_win = v
+                break
+        if status_win is not None:
+            status_win.restore_orig()
+        try:
+            print(json.dumps({"type": type_, "title": title, "message": message}), flush=True)
+        finally:
+            if status_win is not None:
+                status_win.restore_redirect()
+        if type_ == "confirm":
+            resp = sys.stdin.readline()
+            return resp.strip().lower() in ("yes", "true", "1")
+        return None
+    else:
+        from tkinter import messagebox
+        if type_ == "error":
+            return messagebox.showerror(title, message)
+        elif type_ == "info":
+            return messagebox.showinfo(title, message)
+        elif type_ == "warning":
+            return messagebox.showwarning(title, message)
+        elif type_ == "confirm":
+            return messagebox.askokcancel(title, message)
+        else:
+            return None
 
 # 已保存游戏选择区域（含说明、列表和按钮）
 saved_frame = tk.Frame(root)
@@ -1014,8 +1211,99 @@ listbox_remote = Listbox(remote_frame, width=65, height=10)
 listbox_remote.pack()
 remote_btn_frame = tk.Frame(remote_frame)
 remote_btn_frame.pack(pady=3)
+
+extra_backup_frame = tk.Frame(root)
+extra_backup_label = tk.Label(extra_backup_frame, text="本地还原时产生的额外备份列表（双击可还原）")
+extra_backup_label.pack()
+extra_backup_listbox = Listbox(extra_backup_frame, width=65, height=10)
+extra_backup_listbox.pack()
+extra_backup_btn_frame = tk.Frame(extra_backup_frame)
+extra_backup_btn_frame.pack(pady=3)
+tk.Button(extra_backup_btn_frame, text="返回", command=lambda: extra_backup_frame.pack_forget()).pack(side="left", padx=5)
+extra_backup_frame.pack_forget()
+extra_backup_listbox.bind("<Double-Button-1>", lambda e: restore_extra_backup())
+def show_extra_backup_list():
+    local_frame.pack_forget()
+    saved_frame.pack_forget()
+    remote_frame.pack_forget()
+    extra_backup_frame.pack()
+    extra_backup_listbox.delete(0, tk.END)
+    backup_dir = os.path.join(os.getcwd(), "extra_backup")
+    if not os.path.exists(backup_dir):
+        show_message("info", "提示", "没有找到extra_backup目录。")
+        return
+    files = [f for f in os.listdir(backup_dir) if f.lower().endswith('.zip')]
+    if not files:
+        show_message("info", "提示", "extra_backup目录下没有备份文件。")
+        return
+    for f in sorted(files, reverse=True):
+        extra_backup_listbox.insert(tk.END, f)
+
+def restore_extra_backup():
+    sel = extra_backup_listbox.curselection()
+    if not sel:
+        return
+    filename = extra_backup_listbox.get(sel[0])
+    backup_dir = os.path.join(os.getcwd(), "extra_backup")
+    local_zip = os.path.join(backup_dir, filename)
+    try:
+        with zipfile.ZipFile(local_zip, 'r') as z:
+            path_txt = z.read("backup_path.txt").decode("utf-8").strip()
+            restored_path = os.path.expandvars(path_txt)
+            all_names = z.namelist()
+            dir_names = [n.split('/')[0] for n in all_names if '/' in n and not n.startswith('__MACOSX')]
+            if not dir_names:
+                show_message("error", "错误", "备份包中未找到存档目录")
+                return
+            archive_dir = os.path.basename(restored_path)
+            total_size = 0
+            file_count = 0
+            for member in all_names:
+                if member.startswith(archive_dir + "/") and not member.endswith("/"):
+                    info = z.getinfo(member)
+                    total_size += info.file_size
+                    file_count += 1
+            try:
+                info = z.getinfo("backup_path.txt")
+                zip_time = time.strftime('%Y-%m-%d %H:%M:%S', time.struct_time((info.date_time[0], info.date_time[1], info.date_time[2], info.date_time[3], info.date_time[4], info.date_time[5], 0, 0, -1)))
+            except Exception:
+                zip_time = "N/A"
+            msg = (
+                f"存档目录名: {archive_dir}\n"
+                f"文件数: {file_count}\n"
+                f"总大小: {total_size/1024:.2f} KB\n"
+                f"备份时间: {zip_time}\n"
+                f"原路径: {restored_path}\n"
+            )
+            msg += "\n是否确认还原？"
+            if not show_message("confirm", "还原确认", msg):
+                return
+            import shutil
+            if os.path.exists(restored_path) and os.path.isdir(restored_path):
+                try:
+                    for root_, dirs_, files_ in os.walk(restored_path, topdown=False):
+                        for file_ in files_:
+                            try:
+                                os.remove(os.path.join(root_, file_))
+                            except Exception:
+                                pass
+                        for dir_ in dirs_:
+                            try:
+                                shutil.rmtree(os.path.join(root_, dir_))
+                            except Exception:
+                                pass
+                except Exception as e:
+                    show_message("warning", "清空目录失败", f"清空目标目录失败: {e}")
+                    return
+            for member in all_names:
+                if member.startswith(archive_dir + "/"):
+                    z.extract(member, os.path.dirname(restored_path))
+        show_message("info", "还原完成", f"存档已还原到: {restored_path}")
+    except Exception as e:
+        show_message("error", "错误", f"还原失败: {e}")
+tk.Button(remote_btn_frame, text="额外备份列表", command=show_extra_backup_list).pack(side="left", padx=5)
 tk.Button(remote_btn_frame, text="还原选定备份", command=restore_selected).pack(side="left", padx=5)
-show_all_btn = tk.Button(remote_btn_frame, text="显示全部游戏存档", command=show_all_remote_backups)
+show_all_btn = tk.Button(remote_btn_frame, text="远程游戏列表", command=show_all_remote_backups)
 # 默认不pack show_all_btn
 remote_frame.pack_forget()  # 默认隐藏
 listbox_remote.bind("<Double-Button-1>", lambda e: restore_selected())
@@ -1039,7 +1327,7 @@ def show_saved_games():
     except Exception:
         games = []
     if not games:
-        messagebox.showinfo("提示", "没有已保存的游戏，请先选择路径并保存。")
+        show_message("info", "提示", "没有已保存的游戏，请先选择路径并保存。")
         return
     for g in games:
         saved_listbox.insert(tk.END, f"{g['name']}  |  {g['path']}")
@@ -1130,24 +1418,78 @@ try:
         update_selected_info()
 except Exception:
     pass
-# 如果命令行参数为 --quick-action，则执行快速操作
-if len(sys.argv) > 2 and sys.argv[1] == "--quick-action":
+# 如果命令行参数为 --quick-action/--quick-dgaction/--quick-restore/--quick-dgrestore，则执行对应操作
+def quick_restore(game_name):
     try:
-        # root.destroy() 改为清空控件
+        client = get_opendal_operator()
+        if not client:
+            show_message("error", "错误", "WebDAV 未配置")
+            return
+        files = []
+        def walk_dir(path, files):
+            for entry in client.list(path):
+                if not entry.path or entry.path in ('.', './'):
+                    continue
+                entry_name = entry.path.rstrip('/').split('/')[-1]
+                if not entry_name:
+                    continue
+                next_path = path.rstrip('/') + '/' + entry_name
+                if entry.is_dir:
+                    walk_dir(next_path, files)
+                elif next_path.endswith('.zip'):
+                    rel_path = next_path[len('python-upload/'):]
+                    files.append(rel_path)
+        walk_dir(f"python-upload/{game_name}/", files)
+        if not files:
+            show_message("error", "错误", "无远程备份，无法还原。")
+            return
+        files.sort(reverse=True)
+        latest_zip = files[0]
+        print(f"自动还原: {latest_zip}")
+        restore_selected(latest_zip)
+    except Exception as e:
+        print(f"自动还原失败: {e}")
+
+if (len(sys.argv) > 2 and sys.argv[1] == "--quick-action") or ('--quick-dgaction' in sys.argv and len(sys.argv) > 2):
+    try:
         for widget in root.winfo_children():
             widget.destroy()
     except Exception:
         pass
     status_win = StatusWindow(root)
+    if '--quick-dgaction' in sys.argv:
+        root.withdraw()
     def run_quick():
         try:
             quick_action(sys.argv[2])
             sys.exit(0)
         except Exception as e:
             print(f"发生异常: {e}")
+            root.mainloop() 
         finally:
             print("\n操作已完成，可关闭窗口。")
     status_win.root.after(100, run_quick)
+    status_win.mainloop()
+    sys.exit(0)
+elif (len(sys.argv) > 2 and sys.argv[1] == "--quick-restore") or ('--quick-dgrestore' in sys.argv and len(sys.argv) > 2):
+    try:
+        for widget in root.winfo_children():
+            widget.destroy()
+    except Exception:
+        pass
+    status_win = StatusWindow(root)
+    if '--quick-dgrestore' in sys.argv:
+        root.withdraw()
+    def run_restore():
+        try:
+            quick_restore(sys.argv[2])
+            sys.exit(0)
+        except Exception as e:
+            print(f"发生异常: {e}")
+            root.mainloop()
+        finally:
+            print("\n操作已完成，可关闭窗口。")
+    status_win.root.after(100, run_restore)
     status_win.mainloop()
     sys.exit(0)
 else:
