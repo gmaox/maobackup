@@ -17,7 +17,7 @@ from urllib.parse import urljoin, urlparse
 from win10toast import ToastNotifier
 toaster = ToastNotifier()
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-#C:\Users\86150\AppData\Local\Programs\Python\Python38\python.exe -m PyInstaller --add-data "icon.ico;." -i icon.ico maobackup.py --noconsole
+#C:\Users\86150\AppData\Local\Programs\Python\Python38\python.exe -m PyInstaller --add-data "icon.ico;." -i icon.ico maobackup.py --noconsole --noconfirm 
 # 全局变量
 selected_path = None
 config = {}  # 存储 WebDAV 配置
