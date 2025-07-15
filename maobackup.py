@@ -1,4 +1,6 @@
 import base64
+import ctypes
+import subprocess
 import sys
 import time
 import webbrowser
@@ -20,7 +22,12 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 selected_path = None
 config = {}  # 存储 WebDAV 配置
 path_set = set()
-
+addgame_mode = False
+addgame_name = ""
+if len(sys.argv) > 2 and sys.argv[1] == "-addgame":
+    addgame_mode = True
+    addgame_name = sys.argv[2]
+    print(f"addgame_mode: {addgame_mode}, addgame_name: {addgame_name}")
 class WebDAVClient:
     """基于requests的WebDAV客户端，替换opendal功能"""
     def __init__(self, hostname, username, password):
@@ -188,6 +195,28 @@ class WebDAVClient:
             response = self.session.put(url, data=data)
             response.raise_for_status()
             return True
+        except requests.exceptions.HTTPError as e:
+            # 409 Conflict: 目录不存在，自动创建
+            if hasattr(e.response, 'status_code') and e.response.status_code == 409:
+                # 递归创建父目录
+                parent = os.path.dirname(path.rstrip('/'))
+                if parent and parent != path:
+                    self._ensure_dir(parent)
+                try:
+                    # 创建后重试
+                    response = self.session.put(url, data=data)
+                    response.raise_for_status()
+                    return True
+                except Exception as e:
+                    print(f"WebDAV write失败（重试后）：{e}")
+                    print(f"请求URL: {url}")
+                    print(f"请求头: {response.headers if 'response' in locals() else 'N/A'}")
+                    print(f"响应状态码: {response.status_code if 'response' in locals() else 'N/A'}")
+                    if 'response' in locals() and response.content:
+                        print(f"响应内容: {response.content[:500]}...")
+                    return False
+            else:
+                raise
         except Exception as e:
             print(f"WebDAV write失败: {e}")
             print(f"请求URL: {url}")
@@ -297,6 +326,7 @@ def handle_selected_path():
         segments.append(segment)
     dialog = tk.Toplevel(root)
     dialog.title("选择路径分段复制到剪贴板")
+    dialog.attributes('-topmost', True)
     tk.Label(dialog, text="请选择路径分段：").pack(padx=10, pady=5)
     def on_seg(idx):
         global selected_path, game_name
@@ -317,17 +347,22 @@ def handle_selected_path():
                         file_count += 1
                     except Exception:
                         pass
-        # 获取默认游戏名
-        default_name = os.path.basename(chosen.rstrip("\\/"))
-        # 弹窗输入游戏名称，默认值为目录最后一级
-        name = simpledialog.askstring(
-            "请仔细确认备份信息",
-            f"当前路径: {chosen}\n文件数: {file_count}\n总大小: {total_size/1024:.2f} KB\n\n请输入游戏名称：",
-            initialvalue=default_name,
-            parent=root
-        )
-        if not name:
-            return
+        if addgame_mode:
+            name = addgame_name
+            if not show_message("confirm", "添加游戏", f"已添加游戏：{name}，路径：{chosen}\n文件数: {file_count}总大小: {total_size/1024:.2f} KB\n请仔细确认备份信息"):
+                return
+        else:
+            # 获取默认游戏名
+            default_name = os.path.basename(chosen.rstrip("\\/"))
+            # 弹窗输入游戏名称，默认值为目录最后一级
+            name = simpledialog.askstring(
+                "请仔细确认备份信息",
+                f"当前路径: {chosen}\n文件数: {file_count}\n总大小: {total_size/1024:.2f} KB\n\n请输入游戏名称：",
+                initialvalue=default_name,
+                parent=root
+            )
+            if not name:
+                return
         game_name = name
         game_name_var.set(name)
         update_selected_info()
@@ -352,6 +387,8 @@ def handle_selected_path():
         cfg["last_selected"] = {"name": name, "path": chosen}
         with open("webdav_config.json", "w", encoding="utf-8") as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
+        if addgame_mode:
+            sys.exit(0)  # 退出程序
     for idx, seg in enumerate(segments):
         btn = tk.Button(dialog, text=f"{idx+1}: {seg}", anchor="w", width=60,
                         command=lambda i=idx: on_seg(i))
@@ -366,20 +403,8 @@ def backup():
     print(f"开始备份路径: {selected_path}, 游戏名: {game_name}")
     #remark = simpledialog.askstring("备注", "请输入备注（可选）：", parent=root)
     remark = None
-    backup_path = f"python-upload/{game_name}"
+    backup_path = f"maobackup/{game_name}"
     threading.Thread(target=perform_backup, args=(selected_path, game_name, remark, backup_path)).start()
-
-def ensure_parent_dir_opendal(operator, remote_path):
-    """确保远程父目录存在：通过上传一个空文件到父目录下的welcome文件实现"""
-    parent = os.path.dirname(os.path.dirname(remote_path))
-    if parent and parent != ".":
-        # 用 / 替换所有 \\，确保路径格式正确
-        parent = parent.replace("\\", "/")
-        test_file = parent + "/welcome"
-        try:
-            operator.stat(test_file)
-        except Exception:
-            operator.write(test_file, b"")
 
 def perform_backup(path, game_name, remark, backup_path):
     """执行备份：保留父目录，记录完整路径，打包并上传到 WebDAV"""
@@ -442,7 +467,6 @@ def perform_backup(path, game_name, remark, backup_path):
         os.remove(backup_path_file)
 
         print(f"正在上传备份文件: {remote_path}")
-        ensure_parent_dir_opendal(operator, remote_path)
         with open(local_zip, "rb") as f:
             data = f.read()
         if operator.write(remote_path, data):
@@ -503,6 +527,7 @@ def configure_webdav():
     global config
     dialog = tk.Toplevel(root)
     dialog.title("WebDAV 配置")
+    dialog.attributes('-topmost', True)
     dialog.grab_set()
     tk.Label(dialog, text="WebDAV 主机 URL:").grid(row=0, column=0, sticky="e", padx=5, pady=5)
     tk.Label(dialog, text="用户名:").grid(row=1, column=0, sticky="e", padx=5, pady=5)
@@ -553,12 +578,13 @@ def configure_webdav():
         webbrowser.open("https://github.com/gmaox/maobackup")
     btn_frame = tk.Frame(dialog)
     btn_frame.grid(row=5, column=0, columnspan=2, pady=2)
+    tk.Button(btn_frame, text="调试模式", command=lambda: (ctypes.windll.kernel32.AllocConsole(), setattr(sys, 'stdout', open("CONOUT$", "w")))).pack(side="left", padx=5)
     tk.Button(btn_frame, text="坚果云网盘", command=open_jianguoyun).pack(side="left", padx=5)
     tk.Button(btn_frame, text="GitHub地址", command=open_github).pack(side="left", padx=5)
     tk.Button(btn_frame, text="保存WebDAV 配置", command=save).pack(side="left", padx=5)
 
 def list_backups():
-    """递归获取 python-upload/ 下所有 ZIP 文件，并显示在远程列表框，暂停本地监听。若已选择游戏，只显示该游戏存档。"""
+    """递归获取 maobackup/ 下所有 ZIP 文件，并显示在远程列表框，暂停本地监听。若已选择游戏，只显示该游戏存档。"""
     stop_monitor()
     client = get_opendal_operator()
     if not client:
@@ -568,6 +594,11 @@ def list_backups():
         # 确保 path 以 / 结尾
         if not path.endswith('/'):
             path = path + '/'
+        # 检查末尾目录是否重复，例如 maobackup/test1/test1/
+        parts = path.strip('/').split('/')
+        if len(parts) >= 2 and parts[-1] == parts[-2]:
+            # 末尾目录重复，跳出递归
+            return
         for entry in client.list(path):
             # 跳过自身目录（有些 WebDAV 返回 "" 或 "." 作为当前目录）
             if not entry.path or entry.path in ('.', './'):
@@ -577,13 +608,14 @@ def list_backups():
                 continue
             next_path = path + entry_name
             if entry.is_dir:
-                # 只收集一级目录名（即游戏名）
-                if path == "python-upload/":
-                    dirs.append(entry_name)
+                if path == "maobackup/":
+                    # 只收集一级目录名（即游戏名），排除自身
+                    if entry_name != "maobackup":
+                        dirs.append(entry_name)
                 else:
                     walk_dir(next_path, files, dirs)
             elif next_path.endswith('.zip'):
-                rel_path = next_path[len('python-upload/'):]
+                rel_path = next_path[len('maobackup/'):]
                 files.append(rel_path)
     try:
         files = []
@@ -591,14 +623,24 @@ def list_backups():
         # 若已选择游戏，只拉取该游戏的存档
         if game_name_var.get():
             game = game_name_var.get()
-            walk_dir(f"python-upload/{game}/", files, dirs)
+            walk_dir(f"maobackup/{game}/", files, dirs)
             show_all_btn.pack(side="left", padx=5)
             listbox_remote.delete(0, tk.END)
             for f in reversed(files):
                 listbox_remote.insert(tk.END, f)
             listbox_remote.pack()  # 确保显示
+            # 还原点击事件
+            def on_backup_select(event=None):
+                sel = listbox_remote.curselection()
+                if not sel:
+                    return
+                entry = listbox_remote.get(sel[0])
+                # 直接还原选中的备份
+                restore_selected(entry)
+            listbox_remote.unbind("<Double-Button-1>")
+            listbox_remote.bind("<Double-Button-1>", on_backup_select)
         else:
-            walk_dir("python-upload/", files, dirs)
+            walk_dir("maobackup/", files, dirs)
             show_all_btn.pack_forget()
             # 只显示游戏列表
             listbox_remote.delete(0, tk.END)
@@ -626,9 +668,9 @@ def list_backups():
                 # 如果本地没有路径，则下载zip获取路径
                 if not restored_path:
                     temp_files = []
-                    walk_dir(f"python-upload/{game}/", temp_files, [])
+                    walk_dir(f"maobackup/{game}/", temp_files, [])
                     if temp_files:
-                        remote_path = f"python-upload/{temp_files[0]}"
+                        remote_path = f"maobackup/{temp_files[0]}"
                         local_zip = os.path.join(os.getcwd(), os.path.basename(temp_files[0]))
                         if download_webdav_file(remote_path, local_zip):
                             try:
@@ -710,7 +752,7 @@ def download_webdav_file(remote_path, local_path):
         return False
 def restore_selected(entry=None):
     """下载选中的备份 ZIP，读取 backup_path.txt 并恢复文件，自动保存新游戏名和路径到本地配置
-    entry: 可选，远程zip路径（如 python-upload/xxx/xxx.zip），如有则直接还原该文件，否则按listbox选中"""
+    entry: 可选，远程zip路径（如 maobackup/xxx/xxx.zip），如有则直接还原该文件，否则按listbox选中"""
     if entry is None:
         sel = listbox_remote.curselection()
         if not sel:
@@ -723,7 +765,7 @@ def restore_selected(entry=None):
         return
     game = parts[0]
     zipname = '/'.join(parts[1:])
-    remote_path = f"python-upload/{entry}" if not entry.startswith("python-upload/") else entry
+    remote_path = f"maobackup/{entry}" if not entry.startswith("maobackup/") else entry
     client = get_opendal_operator()
     if not client:
         show_message("error", "错误", "WebDAV 未配置")
@@ -775,7 +817,7 @@ def restore_selected(entry=None):
                 if g.get("name") == game and g.get("path") == restored_path:
                     found = True
                     break
-            if not found and game != "python-upload":
+            if not found and game != "maobackup":
                 games.append({"name": game, "path": restored_path})
                 cfg["games"] = games
                 with open("webdav_config.json", "w", encoding="utf-8") as f:
@@ -973,15 +1015,18 @@ def manual_select_path():
                     file_count += 1
                 except Exception:
                     pass
-    default_name = os.path.basename(path.rstrip("\\/"))
-    name = simpledialog.askstring(
-        "请仔细确认备份信息",
-        f"当前路径: {path}\n文件数: {file_count}\n总大小: {total_size/1024:.2f} KB\n\n请输入游戏名称：",
-        initialvalue=default_name,
-        parent=root
-    )
-    if not name:
-        return
+    if addgame_mode:
+        name = addgame_name
+    else:
+        default_name = os.path.basename(path.rstrip("\\/"))
+        name = simpledialog.askstring(
+            "请仔细确认备份信息",
+            f"当前路径: {path}\n文件数: {file_count}\n总大小: {total_size/1024:.2f} KB\n\n请输入游戏名称：",
+            initialvalue=default_name,
+            parent=root
+        )
+        if not name:
+            return
     selected_path = path
     game_name = name
     selected_path_var.set(path)
@@ -1006,6 +1051,9 @@ def manual_select_path():
     cfg["last_selected"] = {"name": name, "path": path}
     with open("webdav_config.json", "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
+    if addgame_mode:
+        show_message("info", "添加游戏", f"已添加游戏：{name}，路径：{path}")
+        sys.exit(0)  # 退出程序
 def quick_action(game_name):
     # 读取本地配置，找到游戏路径（如果本地没有，后面会用zip内路径）
     try:
@@ -1036,9 +1084,9 @@ def quick_action(game_name):
             if entry.is_dir:
                 walk_dir(next_path, files)
             elif next_path.endswith('.zip'):
-                rel_path = next_path[len('python-upload/'):]
+                rel_path = next_path[len('maobackup/'):]
                 files.append(rel_path)
-    walk_dir(f"python-upload/{game_name}/", files)
+    walk_dir(f"maobackup/{game_name}/", files)
     if not files:
         # 没有远程备份，直接用本地路径备份
         if local_path:
@@ -1046,12 +1094,13 @@ def quick_action(game_name):
             do_backup(game_name, local_path)
         else:
             print("无远程备份，且本地未找到路径，无法备份。")
+            subprocess.Popen(["maobackup.exe", "-addgame", game_name])
         return
     # 2. 找到最新zip
     files.sort(reverse=True)
     latest_zip = files[0]
-    # latest_zip 已经是相对 python-upload/ 的路径
-    remote_path = f"python-upload/{latest_zip}"
+    # latest_zip 已经是相对 maobackup/ 的路径
+    remote_path = f"maobackup/{latest_zip}"
     # 3. 下载zip到本地临时文件
     import tempfile
     tmp_zip = tempfile.mktemp(suffix=".zip")
@@ -1120,7 +1169,7 @@ def quick_action(game_name):
 
 def do_backup(game_name, path):
     print(f"自动备份: {game_name} {path}")
-    backup_path = f"python-upload/{game_name}"
+    backup_path = f"maobackup/{game_name}"
     remark = None
     perform_backup(path, game_name, remark, backup_path)
 
@@ -1139,6 +1188,7 @@ def do_backup(game_name, path):
 # ----------- Tkinter 界面布局 -----------
 root = tk.Tk()
 root.title("游戏存档备份工具 v0.12")
+root.attributes('-topmost', True)
 try:
     icon_path = "./_internal/icon.ico"
     root.iconbitmap(icon_path)
@@ -1313,9 +1363,11 @@ selected_path_var = tk.StringVar()
 game_name_var = tk.StringVar()
 def update_selected_info():
     info = f"路径: {selected_path_var.get()}    游戏名: {game_name_var.get()}"
+    if addgame_mode:
+        info = f"当前游戏无路径，请先添加存档路径\n（下面文本框会列出有文件变化的路径，请进入游戏进行存档然后返回该程序进行路径选择）\n即将添加的游戏: {addgame_name}"
     selected_info_var.set(info)
 selected_info_var = tk.StringVar()
-selected_info_var.set("路径:     游戏名: ")
+update_selected_info() # 初始化显示
 tk.Label(root, textvariable=selected_info_var, wraplength=600).pack()
 
 def show_saved_games():
@@ -1363,7 +1415,16 @@ def start_monitor():
         observer.start()
         observers.append(observer)
     monitoring = True
-
+if addgame_mode:
+    # 隐藏 frame 区域的所有按钮
+    for child in frame.winfo_children():
+        child.pack_forget()
+    # 自动执行"添加新游戏"逻辑
+    remote_frame.pack_forget()
+    saved_frame.pack_forget()
+    local_frame.pack()
+    listbox.delete(0, tk.END)
+    start_monitor()
 def stop_monitor():
     global observers, monitoring
     for o in observers:
@@ -1437,9 +1498,9 @@ def quick_restore(game_name):
                 if entry.is_dir:
                     walk_dir(next_path, files)
                 elif next_path.endswith('.zip'):
-                    rel_path = next_path[len('python-upload/'):]
+                    rel_path = next_path[len('maobackup/'):]
                     files.append(rel_path)
-        walk_dir(f"python-upload/{game_name}/", files)
+        walk_dir(f"maobackup/{game_name}/", files)
         if not files:
             show_message("error", "错误", "无远程备份，无法还原。")
             return
@@ -1491,6 +1552,38 @@ elif (len(sys.argv) > 2 and sys.argv[1] == "--quick-restore") or ('--quick-dgres
             print("\n操作已完成，可关闭窗口。")
     status_win.root.after(100, run_restore)
     status_win.mainloop()
+    sys.exit(0)
+# ===== 新增 -backuplist 参数处理 =====
+elif (len(sys.argv) > 2 and sys.argv[1] == "-backuplist"):
+    game_name = sys.argv[2]
+    # 检查本地配置文件中是否有该游戏
+    try:
+        with open("webdav_config.json", "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        games = cfg.get("games", [])
+    except Exception:
+        games = []
+    found = False
+    for g in games:
+        if g.get("name") == game_name:
+            found = True
+            selected_path = g.get("path", "")
+            break
+    if not found:
+        # 没有该游戏，调用添加流程
+        subprocess.Popen(["maobackup.exe", "-addgame", game_name])
+        sys.exit(0)
+    # 有该游戏，设置变量并切换界面
+    game_name_var.set(game_name)
+    selected_path_var.set(selected_path)
+    update_selected_info()
+    # 切换到远程备份界面并显示该游戏的备份
+    local_frame.pack_forget()
+    saved_frame.pack_forget()
+    remote_frame.pack()
+    list_backups()
+    # 进入主循环
+    root.mainloop()
     sys.exit(0)
 else:
     # 主循环
