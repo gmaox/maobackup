@@ -310,6 +310,7 @@ class StatusWindow:
     def mainloop(self):
         self.root.mainloop()
     def on_close(self):
+        self.restore_orig()  # 先恢复标准输出
         self.root.destroy()
         sys.exit(0)
 def handle_selected_path():
@@ -589,6 +590,7 @@ def list_backups():
     client = get_opendal_operator()
     if not client:
         show_message("error", "错误", "WebDAV 未配置")
+        configure_webdav()
         return
     def walk_dir(path, files, dirs):
         # 确保 path 以 / 结尾
@@ -735,7 +737,8 @@ def download_webdav_file(remote_path, local_path):
     """使用WebDAV客户端下载文件"""
     client = get_opendal_operator()
     if not client:
-        print("WebDAV 未配置")
+        show_message("error", "错误", "WebDAV 未配置")
+        configure_webdav()
         return False
     
     try:
@@ -769,6 +772,7 @@ def restore_selected(entry=None):
     client = get_opendal_operator()
     if not client:
         show_message("error", "错误", "WebDAV 未配置")
+        configure_webdav()
         return
     # 修复：本地 zip 路径只用文件名，避免多级目录不存在
     local_zip = os.path.join(os.getcwd(), os.path.basename(zipname))
@@ -1068,6 +1072,9 @@ def quick_action(game_name):
     client = get_opendal_operator()
     if not client:
         show_message("error","错误","WebDAV 未配置")
+        configure_webdav()
+        root.deiconify()
+        root.mainloop()
         return
     # 1. 列出所有远程zip
     files = []
@@ -1485,6 +1492,9 @@ def quick_restore(game_name):
         client = get_opendal_operator()
         if not client:
             show_message("error", "错误", "WebDAV 未配置")
+            configure_webdav()
+            root.deiconify()
+            root.mainloop()
             return
         files = []
         def walk_dir(path, files):
