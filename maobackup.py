@@ -242,9 +242,6 @@ class WebDAVClient:
                 print(f"响应内容: {response.content[:500]}...")
             return None
 
-if datetime.now() > datetime(2025, 12, 3):
-    messagebox.showerror("测试结束", "为保证安全性，该版本已停止使用，请联系作者获取最新版本。")
-    sys.exit(0)
 class MyHandler(FileSystemEventHandler):
     """文件系统事件处理器，将变化目录添加到列表"""
     def __init__(self, listbox, path_set):
@@ -533,7 +530,7 @@ def configure_webdav():
     tk.Label(dialog, text="WebDAV 主机 URL:").grid(row=0, column=0, sticky="e", padx=5, pady=5)
     tk.Label(dialog, text="用户名:").grid(row=1, column=0, sticky="e", padx=5, pady=5)
     tk.Label(dialog, text="密码:").grid(row=2, column=0, sticky="e", padx=5, pady=5)
-    tk.Label(dialog, text="（当尝试还原备份时，程序会将本机原存档压缩在/extra_backup目录中）\n(因此建议定期清理extra_backup下的压缩文件)\n(该版本为测试版本，12月3日之后软件将无法使用，届时请前往下载更新版本)", fg="gray").grid(row=3, column=0, columnspan=2, padx=5, pady=2)
+    tk.Label(dialog, text="（当尝试还原备份时，程序会将本机原存档压缩在/extra_backup目录中）\n(因此建议定期清理extra_backup下的压缩文件)", fg="gray").grid(row=3, column=0, columnspan=2, padx=5, pady=2)
     entry_host = tk.Entry(dialog, width=40)
     entry_user = tk.Entry(dialog, width=40)
     entry_pass = tk.Entry(dialog, width=40, show="*")
