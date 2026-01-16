@@ -491,7 +491,20 @@ def perform_backup(path, game_name, remark, backup_path):
                     return p.replace(val, var, 1)
             return p
 
-        path_for_backup = replace_with_env_vars(path)
+        # 首先检查是否存在对应的自定义变量映射，优先使用自定义变量占位符
+        cfg = load_config()
+        custom = cfg.get('custom_vars', {})
+        custom_var_used = None
+        for var_name, var_path in custom.items():
+            # 规范化路径比较（处理不同的斜杠格式）
+            if os.path.normpath(var_path).lower() == os.path.normpath(path).lower():
+                custom_var_used = var_name
+                break
+        
+        if custom_var_used:
+            path_for_backup = custom_var_used
+        else:
+            path_for_backup = replace_with_env_vars(path)
         with open(backup_path_file, "w", encoding="utf-8") as f:
             f.write(path_for_backup)
         # 3. 打包 backup_path.txt 和存档目录（并列在 zip 根目录）
@@ -1621,7 +1634,7 @@ try:
     icon_path = "./_internal/icon.ico"
     root.iconbitmap(icon_path)
 except Exception as e:
-    messagebox.showerror("错误", f"加载图标失败: {e}")
+    pass
 
 def show_message(type_, title, message):
     if '--quick-dgaction' in sys.argv or '--quick-dgrestore' in sys.argv:
@@ -1705,31 +1718,33 @@ def on_monitor_users_only_change():
 tk.Checkbutton(local_btn_frame, text="只扫描C:/Users/", variable=monitor_users_only_var, command=on_monitor_users_only_change).pack(side="left", padx=5)
 tk.Button(local_btn_frame, text="--选择路径--", command=handle_selected_path).pack(side="left", padx=5)
 tk.Button(local_btn_frame, text="📁手动选择", command=manual_select_path).pack(side="left", padx=5)
-# 暂停/恢复监听按钮：显示为 ⏸︎ 或 ▶︎，点击切换
+# 暂停/恢复监听按钮：点击切换
 monitor_paused = False
-pause_btn_text = tk.StringVar(value='⏸︎')
+pause_btn_text = tk.StringVar(value='暂停')
 def toggle_monitor_pause():
-    """切换监听的暂停/恢复状态：点击时暂停监控并把按钮改为 ▶︎，再次点击恢复并改为 ⏸︎"""
+    """切换监听的暂停/恢复状态"""
     global monitor_paused, monitoring
     try:
         if monitoring:
             stop_monitor()
             monitor_paused = True
             try:
-                pause_btn_text.set('▶︎')
+                pause_btn_text.set('继续')
+                pause_btn.config(fg='red')
             except Exception as e:
                 messagebox.showerror("错误", f"更新按钮状态失败: {e}")
         else:
             start_monitor()
             monitor_paused = False
             try:
-                pause_btn_text.set('⏸︎')
+                pause_btn_text.set('暂停')
+                pause_btn.config(fg='black')
             except Exception as e:
                 messagebox.showerror("错误", f"更新按钮状态失败: {e}")
     except Exception as e:
         messagebox.showerror("错误", f"暂停/恢复监听失败: {e}")
 
-pause_btn = tk.Button(local_btn_frame, textvariable=pause_btn_text, width=3, command=toggle_monitor_pause)
+pause_btn = tk.Button(local_btn_frame, textvariable=pause_btn_text, width=5, command=toggle_monitor_pause)
 pause_btn.pack(side="left", padx=5)
 local_frame.pack_forget()  # 默认隐藏
 
