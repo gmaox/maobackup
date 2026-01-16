@@ -171,8 +171,8 @@ class WebDAVClient:
                             try:
                                 from email.utils import parsedate_to_datetime
                                 last_modified = parsedate_to_datetime(last_modified_str)
-                            except:
-                                pass
+                            except Exception as e:
+                                messagebox.showerror("错误", f"时间解析失败: {e}")
             
             # 创建类似opendal.Stat的对象
             stat_obj = type('Stat', (), {
@@ -317,6 +317,16 @@ def handle_selected_path():
     if not selection:
         return
     full_path = listbox.get(selection[0])
+    # 如果是"远程备份列表"项，则打开远程备份界面
+    if full_path == "--远程备份列表--":
+        # 更新显示信息
+        info = f"当前游戏无路径，请先添加存档路径\n（获取路径之后若远端名称和本地不对应，可在前端游戏详情重命名中快速修改）\n即将添加的游戏: {addgame_name}"
+        selected_info_var.set(info)
+        local_frame.pack_forget()
+        saved_frame.pack_forget()
+        remote_frame.pack()
+        list_backups()
+        return
     parts = full_path.split("\\")
     segments = []
     for i in range(2, len(parts)+1):
@@ -326,7 +336,7 @@ def handle_selected_path():
     dialog.title("选择路径分段复制到剪贴板")
     dialog.attributes('-topmost', True)
     tk.Label(dialog, text="请选择路径分段：").pack(padx=10, pady=5)
-    def on_seg(idx):
+    def on_seg(idx):  # This function handles the selection of segments
         global selected_path, game_name
         chosen = segments[idx]
         root.clipboard_clear()
@@ -334,17 +344,26 @@ def handle_selected_path():
         selected_path = chosen
         selected_path_var.set(chosen)
         dialog.destroy()
-        # 统计文件大小
+        # 统计文件大小（超过50MB则中止统计并提醒用户）
         total_size = 0
         file_count = 0
+        SIZE_LIMIT = 50 * 1024 * 1024
+        oversized = False
         if os.path.exists(chosen):
             for root_, dirs_, files_ in os.walk(chosen):
                 for file_ in files_:
                     try:
                         total_size += os.path.getsize(os.path.join(root_, file_))
                         file_count += 1
-                    except Exception:
-                        pass
+                        if total_size > SIZE_LIMIT:
+                            oversized = True
+                            break
+                    except Exception as e:
+                        messagebox.showerror("错误", f"统计文件大小失败: {e}")
+                if oversized:
+                    break
+        if oversized:
+            show_message("warning", "提示", f"路径 {chosen} 大小超过50 MB，请确认该文件夹是否为游戏存档。")
         if addgame_mode:
             name = addgame_name
             if not show_message("confirm", "添加游戏", f"已添加游戏：{name}，路径：{chosen}\n文件数: {file_count}总大小: {total_size/1024:.2f} KB\n请仔细确认备份信息"):
@@ -364,6 +383,29 @@ def handle_selected_path():
         game_name = name
         game_name_var.set(name)
         update_selected_info()
+        # 若路径未使用系统环境变量，询问是否创建自定义变量
+        try:
+            replaced_check = replace_with_env_vars_global(chosen)
+        except Exception:
+            replaced_check = chosen
+        if replaced_check == chosen:
+            try:
+                if messagebox.askyesno("创建自定义变量", "当前路径未使用系统环境变量。是否为该路径创建一个自定义变量以便跨设备同步？\n\n(程序将为该游戏生成唯一的 %USERSELECTPATH_<GAME>% 占位符并保存映射，恢复时会提示你为该变量选择本地目录。)" ):
+                    # 为当前游戏生成唯一的占位符，例如 %USERSELECTPATH_MYGAME%
+                    var_key = f"%USERSELECTPATH_{sanitize_var_name(name)}%"
+                    try:
+                        cfg = load_config()
+                    except Exception:
+                        cfg = {}
+                    custom = cfg.get('custom_vars', {})
+                    custom[var_key] = chosen
+                    cfg['custom_vars'] = custom
+                    save_config(cfg)
+                    # 注意：为保证配置中保存真实路径，保留 `chosen` 为真实路径，
+                    # 仅保存自定义变量映射，不将占位符写入 games 配置。
+            except Exception as e:
+                messagebox.showerror("错误", f"创建自定义变量失败: {e}")
+
         # 保存到 webdav_config.json
         try:
             with open("webdav_config.json", "r", encoding="utf-8") as f:
@@ -420,9 +462,11 @@ def perform_backup(path, game_name, remark, backup_path):
         remote_path = f"{backup_path}/{backup_name}".replace("\\", "/")
         local_zip = "temp_backup.zip"
 
-        # 1. 获取父目录和目录名
-        parent_dir = os.path.dirname(path)
-        dir_name = os.path.basename(path)
+        # 解析实际路径（如果 path 为自定义变量或含环境变量）
+        real_path = resolve_custom_path(path)
+        # 1. 获取父目录和目录名（使用解析后的实际路径）
+        parent_dir = os.path.dirname(real_path)
+        dir_name = os.path.basename(real_path)
         backup_path_file = os.path.join(parent_dir, "backup_path.txt")
         # 2. 写入完整路径到 backup_path.txt（优先用环境变量）
         env_map = {
@@ -453,11 +497,11 @@ def perform_backup(path, game_name, remark, backup_path):
         # 3. 打包 backup_path.txt 和存档目录（并列在 zip 根目录）
         with zipfile.ZipFile(local_zip, 'w', zipfile.ZIP_DEFLATED) as zipf:
             # 打包存档目录
-            for root, dirs, files in os.walk(path):
+            for root, dirs, files in os.walk(real_path):
                 for file in files:
                     file_path = os.path.join(root, file)
                     # zip 内部路径：存档目录名/子路径
-                    arcname = os.path.join(dir_name, os.path.relpath(file_path, path))
+                    arcname = os.path.join(dir_name, os.path.relpath(file_path, real_path))
                     zipf.write(file_path, arcname)
             # 打包 backup_path.txt 到 zip 根目录
             zipf.write(backup_path_file, "backup_path.txt")
@@ -520,6 +564,218 @@ def get_opendal_operator():
         print(f"WebDAV 客户端初始化失败: {e}")
         return None
 
+# --------- 自定义变量路径支持 Helpers ---------
+def load_config():
+    try:
+        with open("webdav_config.json", "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_config(cfg):
+    try:
+        with open("webdav_config.json", "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"保存配置失败: {e}")
+
+def get_env_map():
+    return {
+        "%CommonProgramFiles%": os.environ.get("CommonProgramFiles", r"C:\\Program Files\\Common Files"),
+        "%COMMONPROGRAMFILES(x86)%": os.environ.get("CommonProgramFiles(x86)", r"C:\\Program Files (x86)\\Common Files"),
+        "%HOMEPATH%": os.environ.get("HOMEPATH", ""),
+        "%USERPROFILE%": os.environ.get("USERPROFILE", ""),
+        "%APPDATA%": os.environ.get("APPDATA", ""),
+        "%ALLUSERSPROFILE%": os.environ.get("ALLUSERSPROFILE", ""),
+        "%TEMP%": os.environ.get("TEMP", ""),
+        "%LOCALAPPDATA%": os.environ.get("LOCALAPPDATA", ""),
+        "%PROGRAMDATA%": os.environ.get("PROGRAMDATA", ""),
+        "%PUBLIC%": os.environ.get("PUBLIC", r"C:\\Users\\Public"),
+    }
+
+def replace_with_env_vars_global(p):
+    env_map = get_env_map()
+    for var, val in sorted(env_map.items(), key=lambda x: -len(str(x[1]))):
+        if val and p.startswith(val):
+            return p.replace(val, var, 1)
+    return p
+
+def prompt_user_select_folder_for_var(varname, explanation=None, suggested_folder=None):
+    # 弹窗让用户选择目录，提供运行进程选择器按钮
+    sel = {"dir": None}
+    dlg = tk.Toplevel(root)
+    dlg.title(f"为自定义变量 {varname} 选择路径")
+    dlg.attributes('-topmost', True)
+    tk.Label(dlg, text=f"自定义变量 {varname} 用于跨设备保存路径占位，您可以选择对应本地目录来创建该变量。", wraplength=500).pack(padx=10, pady=6)
+    # 如果提供了来自远端备份的候选存档目录名，展示给用户参考
+    if suggested_folder:
+        try:
+            tk.Label(dlg, text=f"远端备份候选存档目录：{suggested_folder}", fg="blue", wraplength=500).pack(padx=10, pady=(0,6))
+        except Exception as e:
+            messagebox.showerror("错误", f"创建标签失败: {e}")
+
+    # 运行进程选择区域
+    def show_running_processes():
+        # 隐藏触发按钮和drop_label（如果存在）
+        # 创建可滚动区域来显示进程列表
+        # 动态导入依赖，若不存在则通知用户
+        try:
+            import psutil
+        except Exception:
+            tk.messagebox.showerror("错误", "需要 psutil 模块以枚举进程，请先安装 psutil")
+            return
+        try:
+            import win32gui
+            import win32process
+        except Exception:
+            tk.messagebox.showerror("错误", "需要 pywin32 模块以枚举窗口进程，请先安装 pywin32")
+            return
+        proc_win = tk.Toplevel(dlg)
+        proc_win.title(f"从运行进程选择→{suggested_folder}")
+        proc_win.attributes('-topmost', True)
+        proc_frame = tk.Frame(proc_win, relief='flat')
+        proc_frame.pack(fill=tk.BOTH, expand=False, padx=10, pady=(8, 0))
+
+        canvas = tk.Canvas(proc_frame, height=220)
+        scrollbar = tk.Scrollbar(proc_frame, orient=tk.VERTICAL, command=canvas.yview)
+        inner = tk.Frame(canvas)
+
+        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=inner, anchor='nw')
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        def _bind_wheel(event):
+            canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        def _unbind_wheel(event):
+            canvas.unbind_all("<MouseWheel>")
+        canvas.bind("<Enter>", _bind_wheel)
+        canvas.bind("<Leave>", _unbind_wheel)
+        inner.bind("<Enter>", _bind_wheel)
+        inner.bind("<Leave>", _unbind_wheel)
+
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # 枚举窗口进程
+        hwnd_pid_map = {}
+        try:
+            def enum_window_callback(hwnd, lParam):
+                try:
+                    if win32gui.IsWindowVisible(hwnd) and win32gui.GetWindowText(hwnd):
+                        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                        hwnd_pid_map[pid] = hwnd
+                except Exception as e:
+                    messagebox.showerror("错误", f"枚举窗口失败: {e}")
+                return True
+            win32gui.EnumWindows(enum_window_callback, None)
+        except Exception as e:
+            tk.messagebox.showerror("错误", f"枚举窗口失败: {e}")
+            proc_win.destroy()
+            return
+
+        proc_list = []
+        try:
+            for proc in psutil.process_iter(['pid', 'name', 'exe']):
+                try:
+                    if (
+                        proc.info['pid'] in hwnd_pid_map
+                        and proc.info.get('exe')
+                        and proc.info.get('name')
+                        and proc.info['name'].lower() != "explorer.exe"
+                        and proc.info['name'].lower() != "desktopgame.exe"
+                        and proc.info['name'].lower() != "textinputhost.exe"
+                        and proc.info['name'].lower() != "quickstreamappadd.exe"
+                    ):
+                        proc_list.append(proc)
+                except Exception:
+                    continue
+        except Exception as e:
+            tk.Label(inner, text=f"无法枚举进程: {e}", fg='red').pack(padx=8, pady=8)
+
+        if not proc_list:
+            tk.Label(inner, text="没有检测到可用进程").pack(padx=8, pady=8)
+        else:
+            for proc in proc_list:
+                proc_name = proc.info.get('name', '未知')
+                proc_exe = proc.info.get('exe', '')
+                row = tk.Frame(inner)
+                row.pack(fill=tk.X, padx=4, pady=4)
+                def open_file_dialog(proc_exe=proc_exe):
+                    start_dir = os.path.dirname(proc_exe) if proc_exe and os.path.exists(proc_exe) else ''
+                    file_dialog = tkinter.filedialog.askopenfilename(title="手动选择要添加的游戏文件",
+                                                             filetypes=[("可执行文件", "*.exe;*.lnk")],
+                                                             initialdir=start_dir)
+                    if file_dialog:
+                        sel['dir'] = os.path.dirname(file_dialog)
+                        proc_win.destroy()
+                        dlg.destroy()
+                btn_text = f"{proc_name} ({proc_exe})"
+                btn = tk.Button(row, text="📁"+btn_text, anchor='w', justify='left', command=open_file_dialog)
+                btn.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        btn_row = tk.Frame(proc_win)
+        btn_row.pack(fill=tk.X, pady=6)
+
+    # 按钮：从运行进程选择 / 手动选择 / 取消
+    btns = tk.Frame(dlg)
+    btns.pack(pady=8)
+    tk.Button(btns, text="从运行进程选择", command=show_running_processes).pack(side=tk.LEFT, padx=6)
+    def manual_dir():
+        d = tkinter.filedialog.askdirectory(title=f"为 {varname} 选择目录→{suggested_folder}")
+        if d:
+            sel['dir'] = d
+            dlg.destroy()
+    tk.Button(btns, text="手动选择目录", command=manual_dir).pack(side=tk.LEFT, padx=6)
+    def cancel():
+        dlg.destroy()
+    tk.Button(btns, text="取消", command=cancel).pack(side=tk.LEFT, padx=6)
+
+    dlg.grab_set()
+    dlg.wait_window()
+    return sel['dir']
+
+def sanitize_var_name(name):
+    return name
+    # # 将游戏名转换为适合放在变量名中的大写字母数字和下划线
+    # import re
+    # s = name.upper()
+    # s = re.sub(r"[^A-Z0-9]", "_", s)
+    # # 限制长度
+    # return s[:50]
+
+def resolve_custom_path(path_with_vars, prompt_if_missing=True, suggested_folder=None):
+    # 先尝试系统环境变量
+    expanded = os.path.expandvars(path_with_vars)
+    if '%' not in expanded:
+        return expanded
+    # 加载本地自定义变量映射
+    cfg = load_config()
+    custom = cfg.get('custom_vars', {})
+    # 替换已知自定义变量
+    for k, v in custom.items():
+        if k in path_with_vars:
+            return path_with_vars.replace(k, v)
+    # 未知自定义变量，提示用户选择
+    if prompt_if_missing:
+        import re
+        m = re.search(r"(%[^%]+%)", path_with_vars)
+        varname = m.group(1) if m else None
+        if varname:
+            sel_dir = prompt_user_select_folder_for_var(varname, suggested_folder=suggested_folder)
+            if sel_dir:
+                cfg = load_config()
+                custom = cfg.get('custom_vars', {})
+                custom[varname] = sel_dir
+                cfg['custom_vars'] = custom
+                save_config(cfg)
+                return path_with_vars.replace(varname, sel_dir)
+            else:
+                # 用户取消了自定义变量选择，返回 None 以通知调用方中止操作
+                return None
+    return expanded
+
 def configure_webdav():
     """弹窗集中输入WebDAV参数，账号密码简单加密保存本地"""
     global config
@@ -530,7 +786,22 @@ def configure_webdav():
     tk.Label(dialog, text="WebDAV 主机 URL:").grid(row=0, column=0, sticky="e", padx=5, pady=5)
     tk.Label(dialog, text="用户名:").grid(row=1, column=0, sticky="e", padx=5, pady=5)
     tk.Label(dialog, text="密码:").grid(row=2, column=0, sticky="e", padx=5, pady=5)
-    tk.Label(dialog, text="（当尝试还原备份时，程序会将本机原存档压缩在/extra_backup目录中）\n(因此建议定期清理extra_backup下的压缩文件)", fg="gray").grid(row=3, column=0, columnspan=2, padx=5, pady=2)
+    backup_text = tk.Text(dialog, width=70, height=3, wrap="word", bg=dialog.cget("bg"), bd=0, relief="flat")
+    backup_text.grid(row=3, column=0, columnspan=2, padx=5, pady=2)
+    
+    # 配置文本样式
+    backup_text.tag_configure("gray", foreground="gray")
+    backup_text.tag_configure("link", foreground="blue", underline=True)
+    backup_text.tag_bind("link", "<Button-1>", lambda e: os.startfile(os.path.join(os.getcwd(), "extra_backup")) if sys.platform.startswith("win") else subprocess.Popen(["open", os.path.join(os.getcwd(), "extra_backup")]))
+    backup_text.tag_bind("link", "<Enter>", lambda e: backup_text.config(cursor="hand2"))
+    backup_text.tag_bind("link", "<Leave>", lambda e: backup_text.config(cursor="arrow"))
+    
+    # 插入文本
+    backup_text.insert("end", "（当尝试还原备份时，程序会将本机原存档压缩在/extra_backup目录中）\n（因此", "gray")
+    backup_text.insert("end", "建议定期清理extra_backup下的压缩文件", "link")
+    backup_text.insert("end", ")", "gray")
+    
+    backup_text.config(state="disabled")
     entry_host = tk.Entry(dialog, width=40)
     entry_user = tk.Entry(dialog, width=40)
     entry_pass = tk.Entry(dialog, width=40, show="*")
@@ -545,8 +816,8 @@ def configure_webdav():
             entry_host.insert(0, saved.get("hostname", ""))
             entry_user.insert(0, base64.b64decode(saved.get("username", "")).decode())
             entry_pass.insert(0, base64.b64decode(saved.get("password", "")).decode())
-    except Exception:
-        pass
+    except Exception as e:
+        messagebox.showerror("错误", f"读取WebDAV配置失败: {e}")
 
     def save():
         host = entry_host.get().strip()
@@ -555,14 +826,15 @@ def configure_webdav():
         if not host or not user:
             show_message("error", "错误", "WebDAV 主机和用户名不能为空！")
             return
-        # 简单加密
-        cfg = {
-            "hostname": host,
-            "username": base64.b64encode(user.encode()).decode(),
-            "password": base64.b64encode(pwd.encode()).decode()
-        }
-        with open("webdav_config.json", "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        # 简单加密并合并到已存在的配置，保留原有游戏信息和自定义变量
+        try:
+            cfg = load_config()
+        except Exception:
+            cfg = {}
+        cfg["hostname"] = host
+        cfg["username"] = base64.b64encode(user.encode()).decode()
+        cfg["password"] = base64.b64encode(pwd.encode()).decode()
+        save_config(cfg)
         # 解密后赋值到全局
         config["hostname"] = host
         config["username"] = user
@@ -576,7 +848,26 @@ def configure_webdav():
         webbrowser.open("https://github.com/gmaox/maobackup")
     btn_frame = tk.Frame(dialog)
     btn_frame.grid(row=5, column=0, columnspan=2, pady=2)
-    tk.Button(btn_frame, text="调试模式", command=lambda: (ctypes.windll.kernel32.AllocConsole(), setattr(sys, 'stdout', open("CONOUT$", "w")))).pack(side="left", padx=5)
+    def enable_debug_console():
+        kernel32 = ctypes.windll.kernel32
+        kernel32.AllocConsole()
+        
+        # 使用系统 API 重新打开 CON 设备
+        # 获取新分配的控制台句柄
+        kernel32.GetStdHandle.restype = ctypes.c_void_p
+        kernel32.SetStdHandle.argtypes = [ctypes.c_ulong, ctypes.c_void_p]
+        
+        # STD_OUTPUT_HANDLE = -11, STD_ERROR_HANDLE = -12, STD_INPUT_HANDLE = -10
+        stdout_handle = kernel32.CreateFileW("CONOUT$", 0xC0000000, 3, None, 3, 0, None)
+        kernel32.SetStdHandle(-11, stdout_handle)
+        
+        # 重新设置 sys.stdout
+        sys.stdout = open("CONOUT$", "w", buffering=1)
+        sys.stderr = sys.stdout
+    tk.Button(btn_frame, text="调试模式", command=lambda: (
+        ctypes.windll.kernel32.AllocConsole(),
+        enable_debug_console()
+    )).pack(side="left", padx=5)
     tk.Button(btn_frame, text="坚果云网盘", command=open_jianguoyun).pack(side="left", padx=5)
     tk.Button(btn_frame, text="GitHub地址", command=open_github).pack(side="left", padx=5)
     tk.Button(btn_frame, text="保存WebDAV 配置", command=save).pack(side="left", padx=5)
@@ -610,7 +901,13 @@ def list_backups():
                 if path == "maobackup/":
                     # 只收集一级目录名（即游戏名），排除自身
                     if entry_name != "maobackup":
-                        dirs.append(entry_name)
+                        # 获取目录的修改时间用于排序
+                        try:
+                            stat_info = client.stat(next_path)
+                            mtime = stat_info.last_modified if stat_info else None
+                        except Exception:
+                            mtime = None
+                        dirs.append((entry_name, mtime))
                 else:
                     walk_dir(next_path, files, dirs)
             elif next_path.endswith('.zip'):
@@ -641,10 +938,27 @@ def list_backups():
         else:
             walk_dir("maobackup/", files, dirs)
             show_all_btn.pack_forget()
-            # 只显示游戏列表
+            # 按修改时间排序：从新到旧（mtime 越大越新，所以降序排列）
+            # dirs 现在是 (name, mtime) 元组的列表
+            dirs_sorted = sorted(dirs, key=lambda x: (x[1] if x[1] is not None else 0), reverse=True)
+            # 只显示游戏列表，按本地配置着色
+            try:
+                cfg = load_config()
+                saved_games = {g.get("name"): g.get("path") for g in cfg.get("games", [])}
+            except Exception:
+                saved_games = {}
             listbox_remote.delete(0, tk.END)
-            for d in dirs:
-                listbox_remote.insert(tk.END, d)
+            for dir_name, mtime in dirs_sorted:
+                listbox_remote.insert(tk.END, dir_name)
+                idx = listbox_remote.size() - 1
+                try:
+                    if saved_games.get(dir_name):
+                        listbox_remote.itemconfig(idx, fg='gray')
+                    else:
+                        listbox_remote.itemconfig(idx, fg='black')
+                except Exception:
+                    # 兼容旧版 Tkinter 未支持 itemconfig 的情况，忽略着色错误
+                    pass
             listbox_remote.pack()
             # 绑定点击事件：点击后自动选择该游戏并拉取存档
             def on_game_select(event=None):
@@ -662,8 +976,8 @@ def list_backups():
                         if g.get("name") == game and g.get("path"):
                             restored_path = g["path"]
                             break
-                except Exception:
-                    pass
+                except Exception as e:
+                    messagebox.showerror("错误", f"读取游戏配置失败: {e}")
                 # 如果本地没有路径，则下载zip获取路径
                 if not restored_path:
                     temp_files = []
@@ -675,14 +989,29 @@ def list_backups():
                             try:
                                 with zipfile.ZipFile(local_zip, 'r') as z:
                                     path_txt = z.read("backup_path.txt").decode("utf-8").strip()
-                                    restored_path = os.path.expandvars(path_txt)
-                            except Exception:
-                                pass
+                                    # 尝试从zip中获取首个存档目录名，作为提示传入resolve_custom_path
+                                    try:
+                                        all_names_tmp = z.namelist()
+                                        dir_names_tmp = [n.split('/')[0] for n in all_names_tmp if '/' in n and not n.startswith('__MACOSX')]
+                                        suggested = dir_names_tmp[0] if dir_names_tmp else None
+                                    except Exception:
+                                        suggested = None
+                                    restored_path = resolve_custom_path(path_txt, suggested_folder=suggested)
+                                    # 如果用户在选择自定义变量时取消，resolve_custom_path 返回 None
+                                    # 此时应当终止当前逻辑并清理临时文件
+                                    if restored_path is None:
+                                        try:
+                                            os.remove(local_zip)
+                                        except Exception as e:
+                                            messagebox.showerror("错误", f"删除临时文件失败: {e}")
+                                        return
+                            except Exception as e:
+                                messagebox.showerror("错误", f"读取zip文件失败: {e}")
                             finally:
                                 try:
                                     os.remove(local_zip)
-                                except Exception:
-                                    pass
+                                except Exception as e:
+                                    messagebox.showerror("错误", f"删除临时文件失败: {e}")
                 # 设置全局变量并刷新
                 global selected_path, game_name
                 selected_path = restored_path if restored_path else ""
@@ -779,12 +1108,12 @@ def restore_selected(entry=None):
         return
     try:
         with zipfile.ZipFile(local_zip, 'r') as z:
-            # 读取 backup_path.txt
+            # 读取 backup_path.txt，并从zip中获取首个存档目录名，作为提示传入resolve_custom_path
             path_txt = z.read("backup_path.txt").decode("utf-8").strip()
-            restored_path = os.path.expandvars(path_txt)
-            # 找到存档目录名
             all_names = z.namelist()
             dir_names = [n.split('/')[0] for n in all_names if '/' in n and not n.startswith('__MACOSX')]
+            suggested = dir_names[0] if dir_names else None
+            restored_path = resolve_custom_path(path_txt, suggested_folder=suggested)
             if not dir_names:
                 show_message("error", "错误", "备份包中未找到存档目录")
                 return
@@ -792,11 +1121,18 @@ def restore_selected(entry=None):
             # 统计存档目录下文件总大小
             total_size = 0
             file_count = 0
+            SIZE_LIMIT = 50 * 1024 * 1024
+            oversized = False
             for member in all_names:
                 if member.startswith(archive_dir + "/") and not member.endswith("/"):
                     info = z.getinfo(member)
                     total_size += info.file_size
                     file_count += 1
+                    if total_size > SIZE_LIMIT:
+                        oversized = True
+                        break
+            if oversized:
+                show_message("warning", "提示", f"远程备份包中存档总大小超过50 MB，已停止统计。")
             # 获取zip内backup_path.txt的修改时间作为备份时间
             try:
                 info = z.getinfo("backup_path.txt")
@@ -867,8 +1203,8 @@ def restore_selected(entry=None):
                 finally:
                     try:
                         os.remove(backup_path_txt)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        messagebox.showerror("错误", f"删除临时文件失败: {e}")
             # ----------- 新增：清空目标目录 -------------
             if os.path.exists(restored_path) and os.path.isdir(restored_path):
                 try:
@@ -876,13 +1212,13 @@ def restore_selected(entry=None):
                         for file_ in files_:
                             try:
                                 os.remove(os.path.join(root_, file_))
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                messagebox.showerror("错误", f"删除文件失败: {e}")
                         for dir_ in dirs_:
                             try:
                                 shutil.rmtree(os.path.join(root_, dir_))
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                messagebox.showerror("错误", f"删除目录失败: {e}")
                 except Exception as e:
                     return
             # ----------- 解压存档目录到目标路径 -------------
@@ -898,23 +1234,63 @@ def restore_selected(entry=None):
 
 def delete_selected_game():
     sel = saved_listbox.curselection()
-    if not sel:
-        show_message("info", "提示", "请先选择要删除的游戏。")
-        return
-    idx = sel[0]
+    g = None
+    idx = None
+    
     try:
         with open("webdav_config.json", "r", encoding="utf-8") as f:
             cfg = json.load(f)
         games = cfg.get("games", [])
     except Exception:
-        games = []
-    if idx >= len(games):
+        show_message("info", "提示", "请先选择要删除的游戏。")
         return
-    g = games[idx]
+    
+    if not sel:
+        # 尝试从 selected_path_var 和 game_name_var 读取当前选择
+        current_game = game_name_var.get()
+        current_path = selected_path_var.get()
+        if not current_game or not current_path:
+            show_message("info", "提示", "请先选择要删除的游戏。")
+            return
+        # 查找匹配的游戏及其索引
+        for i, game in enumerate(games):
+            if game.get("name") == current_game and game.get("path") == current_path:
+                g = game
+                idx = i
+                break
+        if not g:
+            show_message("info", "提示", "未找到该游戏配置。")
+            return
+    else:
+        idx = sel[0]
+        if idx >= len(games):
+            return
+        g = games[idx]
+    
     if not show_message("confirm", "确认", f"确定要删除游戏：{g['name']} ?"):
         return
+    # 删除游戏记录
     del games[idx]
+    # 确保 cfg 存在（读取失败分支可能未定义 cfg）
+    try:
+        cfg
+    except NameError:
+        cfg = {}
     cfg["games"] = games
+    # 同步移除与该游戏路径关联的自定义变量映射
+    try:
+        path_to_remove = g.get("path")
+        custom = cfg.get("custom_vars", {}) or {}
+        # 删除键名等于 path（占位符）或值等于 path（映射到该路径）的条目
+        keys_to_remove = [k for k, v in custom.items() if k == path_to_remove or v == path_to_remove]
+        for k in keys_to_remove:
+            try:
+                del custom[k]
+            except Exception as e:
+                messagebox.showerror("错误", f"删除自定义变量失败: {e}")
+        cfg["custom_vars"] = custom
+    except Exception as e:
+        messagebox.showerror("错误", f"处理自定义变量失败: {e}")
     # 检查last_selected是否还存在于games
     last = cfg.get("last_selected", {})
     last_name = last.get("name", None)
@@ -943,18 +1319,40 @@ def add_desktop_shortcut():
     import os
     sel = saved_listbox.curselection()
     if not sel:
-        show_message("info", "提示", "请先选择要添加快捷方式的游戏。")
-        return
-    idx = sel[0]
-    try:
-        with open("webdav_config.json", "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-        games = cfg.get("games", [])
-    except Exception:
-        games = []
-    if idx >= len(games):
-        return
-    g = games[idx]
+        # 尝试从 selected_path_var 和 game_name_var 读取当前选择
+        current_game = game_name_var.get()
+        current_path = selected_path_var.get()
+        if not current_game or not current_path:
+            show_message("info", "提示", "请先选择要添加快捷方式的游戏。")
+            return
+        # 从配置中找到对应的游戏
+        try:
+            with open("webdav_config.json", "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            games = cfg.get("games", [])
+        except Exception:
+            show_message("info", "提示", "请先选择要添加快捷方式的游戏。")
+            return
+        # 查找匹配的游戏
+        g = None
+        for game in games:
+            if game.get("name") == current_game and game.get("path") == current_path:
+                g = game
+                break
+        if not g:
+            show_message("info", "提示", "未找到该游戏配置。")
+            return
+    else:
+        idx = sel[0]
+        try:
+            with open("webdav_config.json", "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            games = cfg.get("games", [])
+        except Exception:
+            games = []
+        if idx >= len(games):
+            return
+        g = games[idx]
     shortcut_name = f"{g['name']}_快速同步.bat"
     # 多种方式获取桌面路径
     desktop = os.path.join(os.environ.get("USERPROFILE", r"C:\\Users\\Public"), "Desktop")
@@ -971,8 +1369,8 @@ def add_desktop_shortcut():
     if not os.path.exists(desktop):
         try:
             desktop = os.path.join(os.path.expanduser("~"), "桌面")
-        except Exception:
-            pass
+        except Exception as e:
+            messagebox.showerror("错误", f"获取桌面路径失败: {e}")
     if not os.path.exists(desktop):
         show_message("error", "桌面路径错误", f"无法定位桌面路径，请手动创建快捷方式。\n尝试的路径: {desktop}")
         return
@@ -981,6 +1379,7 @@ def add_desktop_shortcut():
     # 生成bat内容
     # 用引号包裹路径，防止空格和中文问题
     bat_content = f'''@echo off
+chcp 65001 >nul
 cd /d "{os.path.dirname(exe_path)}"
 "{exe_path}" --quick-action "{g["name"]}"
 exit
@@ -1014,8 +1413,8 @@ def manual_select_path():
                 try:
                     total_size += os.path.getsize(os.path.join(root_, file_))
                     file_count += 1
-                except Exception:
-                    pass
+                except Exception as e:
+                    messagebox.showerror("错误", f"计算文件大小失败: {e}")
     if addgame_mode:
         name = addgame_name
     else:
@@ -1039,6 +1438,24 @@ def manual_select_path():
             cfg = json.load(f)
     except Exception:
         cfg = {}
+    # 若路径未使用系统环境变量，询问是否创建自定义变量
+    try:
+        replaced_check = replace_with_env_vars_global(path)
+    except Exception:
+        replaced_check = path
+    if replaced_check == path:
+        try:
+            if messagebox.askyesno("创建自定义变量", "当前路径未使用系统环境变量。是否为该路径创建一个自定义变量以便跨设备迁移？\n\n(程序将为该游戏生成唯一的 %USERSELECTPATH_<GAME>% 占位符并保存映射，恢复时会提示你为该变量选择本地目录。)" ):
+                # 生成每个游戏唯一的占位符
+                var_key = f"%USERSELECTPATH_{sanitize_var_name(name)}%"
+                custom = cfg.get('custom_vars', {})
+                custom[var_key] = path
+                cfg['custom_vars'] = custom
+                save_config(cfg)
+                # 注意：为保证配置中保存真实路径，保留 `path` 为真实路径，
+                # 仅保存自定义变量映射，不将占位符写入 games 配置。
+        except Exception as e:
+            messagebox.showerror("错误", f"创建自定义变量失败: {e}")
     games = cfg.get("games", [])
     found = False
     for g in games:
@@ -1117,7 +1534,14 @@ def quick_action(game_name):
             # 4. 读取 backup_path.txt 得到原始路径
             try:
                 path_txt = z.read("backup_path.txt").decode("utf-8").strip()
-                restored_path = os.path.expandvars(path_txt)
+                # 从zip里提取首个目录名作为提示，传给resolve_custom_path
+                try:
+                    all_names_tmp = z.namelist()
+                    dir_names_tmp = [n.split('/')[0] for n in all_names_tmp if '/' in n and not n.startswith('__MACOSX')]
+                    suggested = dir_names_tmp[0] if dir_names_tmp else None
+                except Exception:
+                    suggested = None
+                restored_path = resolve_custom_path(path_txt, suggested_folder=suggested)
             except Exception:
                 print("zip包中未找到 backup_path.txt，无法自动还原")
                 restored_path = None
@@ -1130,8 +1554,8 @@ def quick_action(game_name):
                             mtime = os.path.getmtime(os.path.join(root_, file_))
                             if mtime > local_latest_mtime:
                                 local_latest_mtime = mtime
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            messagebox.showerror("错误", f"获取文件修改时间失败: {e}")
             elif local_path and os.path.exists(local_path):
                 for root_, dirs_, files_ in os.walk(local_path):
                     for file_ in files_:
@@ -1139,8 +1563,8 @@ def quick_action(game_name):
                             mtime = os.path.getmtime(os.path.join(root_, file_))
                             if mtime > local_latest_mtime:
                                 local_latest_mtime = mtime
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            messagebox.showerror("错误", f"获取文件修改时间失败: {e}")
             # 6. 直接用zip内backup_path.txt的修改时间作为远程备份时间
             try:
                 info = z.getinfo("backup_path.txt")
@@ -1168,8 +1592,8 @@ def quick_action(game_name):
     finally:
         try:
             os.remove(tmp_zip)
-        except Exception:
-            pass
+        except Exception as e:
+            messagebox.showerror("错误", f"删除临时文件失败: {e}")
 
 def do_backup(game_name, path):
     print(f"自动备份: {game_name} {path}")
@@ -1191,13 +1615,13 @@ def do_backup(game_name, path):
 
 # ----------- Tkinter 界面布局 -----------
 root = tk.Tk()
-root.title("游戏存档备份工具 v0.12")
+root.title("游戏存档备份工具 v3")
 root.attributes('-topmost', True)
 try:
     icon_path = "./_internal/icon.ico"
     root.iconbitmap(icon_path)
-except Exception:
-    pass
+except Exception as e:
+    messagebox.showerror("错误", f"加载图标失败: {e}")
 
 def show_message(type_, title, message):
     if '--quick-dgaction' in sys.argv or '--quick-dgrestore' in sys.argv:
@@ -1241,6 +1665,21 @@ btn_frame = tk.Frame(saved_frame)
 btn_frame.pack(pady=3)
 tk.Button(btn_frame, text="删除游戏", command=delete_selected_game).pack(side="left", padx=5)
 tk.Button(btn_frame, text="添加桌面快捷方式", command=add_desktop_shortcut).pack(side="left", padx=5)
+def open_config_file():
+    path = os.path.abspath("webdav_config.json")
+    try:
+        if sys.platform.startswith("win"):
+            os.startfile(path)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        else:
+            try:
+                subprocess.Popen(["xdg-open", path])
+            except Exception:
+                webbrowser.open("file://" + path)
+    except Exception as e:
+        show_message("error", "打开失败", f"无法打开配置文件: {e}")
+tk.Button(btn_frame, text="打开配置文件", command=lambda: {open_config_file(),print("test")}).pack(side="left", padx=5)
 tk.Button(btn_frame, text="选择游戏", command=lambda: select_saved_game_action()).pack(side="left", padx=5)
 saved_frame.pack_forget()  # 默认隐藏
 
@@ -1253,8 +1692,45 @@ listbox.pack()
 listbox.bind("<Double-Button-1>", lambda e: handle_selected_path())
 local_btn_frame = tk.Frame(local_frame)
 local_btn_frame.pack(pady=3)
-tk.Button(local_btn_frame, text="选择路径分段", command=handle_selected_path).pack(side="left", padx=5)
-tk.Button(local_btn_frame, text="手动选择路径", command=manual_select_path).pack(side="left", padx=5)
+# 只扫描 C:/Users 的复选框，默认选中
+monitor_users_only_var = tk.BooleanVar(value=True)
+def on_monitor_users_only_change():
+    # 若当前正在监控，重启监控以应用新的设置
+    try:
+        if monitoring:
+            stop_monitor()
+            start_monitor()
+    except Exception as e:
+        messagebox.showerror("错误", f"切换监听设置失败: {e}")
+tk.Checkbutton(local_btn_frame, text="只扫描C:/Users/", variable=monitor_users_only_var, command=on_monitor_users_only_change).pack(side="left", padx=5)
+tk.Button(local_btn_frame, text="--选择路径--", command=handle_selected_path).pack(side="left", padx=5)
+tk.Button(local_btn_frame, text="📁手动选择", command=manual_select_path).pack(side="left", padx=5)
+# 暂停/恢复监听按钮：显示为 ⏸︎ 或 ▶︎，点击切换
+monitor_paused = False
+pause_btn_text = tk.StringVar(value='⏸︎')
+def toggle_monitor_pause():
+    """切换监听的暂停/恢复状态：点击时暂停监控并把按钮改为 ▶︎，再次点击恢复并改为 ⏸︎"""
+    global monitor_paused, monitoring
+    try:
+        if monitoring:
+            stop_monitor()
+            monitor_paused = True
+            try:
+                pause_btn_text.set('▶︎')
+            except Exception as e:
+                messagebox.showerror("错误", f"更新按钮状态失败: {e}")
+        else:
+            start_monitor()
+            monitor_paused = False
+            try:
+                pause_btn_text.set('⏸︎')
+            except Exception as e:
+                messagebox.showerror("错误", f"更新按钮状态失败: {e}")
+    except Exception as e:
+        messagebox.showerror("错误", f"暂停/恢复监听失败: {e}")
+
+pause_btn = tk.Button(local_btn_frame, textvariable=pause_btn_text, width=3, command=toggle_monitor_pause)
+pause_btn.pack(side="left", padx=5)
 local_frame.pack_forget()  # 默认隐藏
 
 # 远程备份区域（含说明、列表和按钮）
@@ -1303,24 +1779,33 @@ def restore_extra_backup():
     try:
         with zipfile.ZipFile(local_zip, 'r') as z:
             path_txt = z.read("backup_path.txt").decode("utf-8").strip()
-            restored_path = os.path.expandvars(path_txt)
             all_names = z.namelist()
             dir_names = [n.split('/')[0] for n in all_names if '/' in n and not n.startswith('__MACOSX')]
+            suggested = dir_names[0] if dir_names else None
+            restored_path = resolve_custom_path(path_txt, suggested_folder=suggested)
             if not dir_names:
                 show_message("error", "错误", "备份包中未找到存档目录")
                 return
             archive_dir = os.path.basename(restored_path)
             total_size = 0
             file_count = 0
+            SIZE_LIMIT = 50 * 1024 * 1024
+            oversized = False
             for member in all_names:
                 if member.startswith(archive_dir + "/") and not member.endswith("/"):
                     info = z.getinfo(member)
                     total_size += info.file_size
                     file_count += 1
+                    if total_size > SIZE_LIMIT:
+                        oversized = True
+                        break
+            if oversized:
+                show_message("warning", "提示", f"备份文件 {filename} 中存档总大小超过50 MB，已停止统计。")
             try:
                 info = z.getinfo("backup_path.txt")
                 zip_time = time.strftime('%Y-%m-%d %H:%M:%S', time.struct_time((info.date_time[0], info.date_time[1], info.date_time[2], info.date_time[3], info.date_time[4], info.date_time[5], 0, 0, -1)))
-            except Exception:
+            except Exception as e:
+                messagebox.showerror("错误", f"读取备份时间失败: {e}")
                 zip_time = "N/A"
             msg = (
                 f"存档目录名: {archive_dir}\n"
@@ -1339,13 +1824,13 @@ def restore_extra_backup():
                         for file_ in files_:
                             try:
                                 os.remove(os.path.join(root_, file_))
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                messagebox.showerror("错误", f"删除文件失败: {e}")
                         for dir_ in dirs_:
                             try:
                                 shutil.rmtree(os.path.join(root_, dir_))
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                messagebox.showerror("错误", f"删除目录失败: {e}")
                 except Exception as e:
                     show_message("warning", "清空目录失败", f"清空目标目录失败: {e}")
                     return
@@ -1383,7 +1868,7 @@ def show_saved_games():
     except Exception:
         games = []
     if not games:
-        show_message("info", "提示", "没有已保存的游戏，请先选择路径并保存。")
+        show_message("info", "提示", "还没有游戏，使用“添加新游戏”按钮添加。")
         return
     for g in games:
         saved_listbox.insert(tk.END, f"{g['name']}  |  {g['path']}")
@@ -1402,12 +1887,28 @@ tk.Button(frame, text="配置WebDAV", command=configure_webdav).pack(side="left"
 # 监听相关全局变量
 observers = []
 monitoring = False
+monitor_paused = False
 
 def start_monitor():
     global observers, monitoring, path_set
     if monitoring:
         return
     path_set.clear()
+    # 如果用户勾选了只扫描 C:/Users/，则仅监听该路径（若存在）
+    try:
+        if 'monitor_users_only_var' in globals() and monitor_users_only_var.get():
+            user_root = os.path.join(os.path.splitdrive(os.getcwd())[0] + os.sep, 'Users')
+            if os.path.exists(user_root):
+                handler = MyHandler(listbox, path_set)
+                observer = Observer()
+                observer.schedule(handler, user_root, recursive=True)
+                observer.start()
+                observers.append(observer)
+                monitoring = True
+                return
+    except Exception:
+        # 出错则回退到默认行为
+        pass
     from psutil import disk_partitions
     partitions = [p.device for p in disk_partitions()]
     for path in partitions:
@@ -1428,6 +1929,8 @@ if addgame_mode:
     saved_frame.pack_forget()
     local_frame.pack()
     listbox.delete(0, tk.END)
+    # 在 listbox 第一项显示"远程备份列表"
+    listbox.insert(0, "--远程备份列表--")
     start_monitor()
 def stop_monitor():
     global observers, monitoring
@@ -1436,7 +1939,6 @@ def stop_monitor():
         o.join()
     observers.clear()
     monitoring = False
-
 
 def select_saved_game_action(event=None):
     sel = saved_listbox.curselection()
@@ -1470,19 +1972,20 @@ def select_saved_game_action(event=None):
     with open("webdav_config.json", "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
 saved_listbox.bind("<Double-Button-1>", select_saved_game_action)
-# 启动时自动读取 last_selected
-try:
-    with open("webdav_config.json", "r", encoding="utf-8") as f:
-        cfg = json.load(f)
-    last = cfg.get("last_selected")
-    if last:
-        selected_path = last.get("path", "")
-        game_name = last.get("name", "")
-        selected_path_var.set(selected_path)
-        game_name_var.set(game_name)
-        update_selected_info()
-except Exception:
-    pass
+# 启动时自动读取 last_selected（addgame_mode 时不读取）
+if not addgame_mode:
+    try:
+        with open("webdav_config.json", "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        last = cfg.get("last_selected")
+        if last:
+            selected_path = last.get("path", "")
+            game_name = last.get("name", "")
+            selected_path_var.set(selected_path)
+            game_name_var.set(game_name)
+            update_selected_info()
+    except Exception as e:
+        messagebox.showerror("错误", f"读取最后选择的游戏失败: {e}")
 # 如果命令行参数为 --quick-action/--quick-dgaction/--quick-restore/--quick-dgrestore，则执行对应操作
 def quick_restore(game_name):
     try:
@@ -1522,8 +2025,8 @@ if (len(sys.argv) > 2 and sys.argv[1] == "--quick-action") or ('--quick-dgaction
     try:
         for widget in root.winfo_children():
             widget.destroy()
-    except Exception:
-        pass
+    except Exception as e:
+        messagebox.showerror("错误", f"清除窗口失败: {e}")
     status_win = StatusWindow(root)
     if '--quick-dgaction' in sys.argv:
         root.withdraw()
@@ -1543,8 +2046,8 @@ elif (len(sys.argv) > 2 and sys.argv[1] == "--quick-restore") or ('--quick-dgres
     try:
         for widget in root.winfo_children():
             widget.destroy()
-    except Exception:
-        pass
+    except Exception as e:
+        messagebox.showerror("错误", f"清除窗口失败: {e}")
     status_win = StatusWindow(root)
     if '--quick-dgrestore' in sys.argv:
         root.withdraw()
